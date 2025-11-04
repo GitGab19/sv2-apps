@@ -6,7 +6,7 @@ use stratum_apps::{
             has_requires_std_job, has_work_selection, SetupConnection, SetupConnectionSuccess,
         },
         handlers_sv2::HandleCommonMessagesFromClientAsync,
-        parsers_sv2::AnyMessage,
+        parsers_sv2::{AnyMessage, Tlv},
     },
     utils::types::Sv2Frame,
 };
@@ -15,10 +15,16 @@ use tracing::info;
 impl HandleCommonMessagesFromClientAsync for Downstream {
     type Error = PoolError;
 
+    fn get_negotiated_extensions_with_client(&self, _client_id: Option<usize>) -> Vec<u16> {
+        self.downstream_data
+            .super_safe_lock(|data| data.negotiated_extensions.clone())
+    }
+
     async fn handle_setup_connection(
         &mut self,
         _client_id: Option<usize>,
         msg: SetupConnection<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!(
             "Received `SetupConnection`: version={}, flags={:b}",

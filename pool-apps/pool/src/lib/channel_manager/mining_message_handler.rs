@@ -14,9 +14,12 @@ use stratum_apps::stratum_core::{
         },
         Vardiff, VardiffState,
     },
+    extensions_sv2::{
+        UserIdentity, EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY,
+    },
     handlers_sv2::{HandleMiningMessagesFromClientAsync, SupportedChannelTypes},
     mining_sv2::*,
-    parsers_sv2::{Mining, TemplateDistribution},
+    parsers_sv2::{Mining, TemplateDistribution, Tlv, TlvField},
     template_distribution_sv2::SubmitSolution,
 };
 use tracing::{error, info};
@@ -45,10 +48,28 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         Ok(true)
     }
 
+    fn get_negotiated_extensions_with_client(&self, client_id: Option<usize>) -> Vec<u16> {
+        let downstream_id =
+            client_id.expect("client_id must be present for downstream_id extraction");
+        self.channel_manager_data
+            .super_safe_lock(|channel_manager_data| {
+                channel_manager_data
+                    .downstream
+                    .get(&downstream_id)
+                    .map(|downstream| {
+                        downstream
+                            .downstream_data
+                            .super_safe_lock(|data| data.negotiated_extensions.clone())
+                    })
+                    .expect("negotiated_extensions must be present")
+            })
+    }
+
     async fn handle_close_channel(
         &mut self,
         client_id: Option<usize>,
         msg: CloseChannel<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received Close Channel: {msg}");
         let downstream_id =
@@ -77,6 +98,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: OpenStandardMiningChannel<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         let request_id = msg.get_request_id_as_u32();
         let user_identity = msg.user_identity.as_utf8_or_hex();
@@ -241,6 +263,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: OpenExtendedMiningChannel<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         let request_id = msg.get_request_id_as_u32();
         let user_identity = msg.user_identity.as_utf8_or_hex();
@@ -496,6 +519,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: SubmitSharesStandard,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received SubmitSharesStandard: {msg}");
         let downstream_id =
@@ -657,10 +681,28 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: SubmitSharesExtended<'_>,
+        tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received SubmitSharesExtended: {msg}");
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
+
+        // Extract user_identity from TLV fields if the extension is negotiated
+        let negotiated_extensions = self.get_negotiated_extensions_with_client(client_id);
+        let user_identity =
+            if negotiated_extensions.contains(&EXTENSION_TYPE_WORKER_HASHRATE_TRACKING) {
+                tlv_fields.and_then(|tlvs| {
+                    tlvs.iter()
+                        .find(|tlv| {
+                            tlv.type_.extension_type == EXTENSION_TYPE_WORKER_HASHRATE_TRACKING
+                                && tlv.type_.field_type == TLV_FIELD_TYPE_USER_IDENTITY
+                        })
+                        .and_then(|tlv| UserIdentity::from_tlv(tlv).ok())
+                })
+            } else {
+                None
+            };
+
         let messages = self.channel_manager_data.super_safe_lock(|channel_manager_data| {
             let channel_id = msg.channel_id;
             let Some(downstream) = channel_manager_data.downstream.get(&downstream_id) else {
@@ -681,6 +723,10 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     error!("SubmitSharesError: downstream_id: {}, channel_id: {}, sequence_number: {}, error_code: invalid-channel-id ❌", downstream_id, channel_id, msg.sequence_number);
                     return Ok(vec![(downstream_id, Mining::SubmitSharesError(error)).into()]);
                 };
+
+                if let Some(user_identity) = user_identity {
+                    extended_channel.set_user_identity(user_identity.as_string_or_hex());
+                }
 
                 let Some(vardiff) = channel_manager_data.vardiff.get_mut(&(downstream_id, channel_id).into()) else {
                     return Err(PoolError::VardiffNotFound(channel_id));
@@ -825,6 +871,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: UpdateChannel<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
@@ -953,6 +1000,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: SetCustomMiningJob<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
         let downstream_id =

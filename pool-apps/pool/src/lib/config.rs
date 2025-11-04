@@ -35,6 +35,8 @@ pub struct PoolConfig {
     share_batch_size: SharesBatchSize,
     log_file: Option<PathBuf>,
     server_id: u16,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
 }
 
 impl PoolConfig {
@@ -43,6 +45,7 @@ impl PoolConfig {
     /// # Panics
     ///
     /// Panics if `coinbase_reward_script` is empty.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool_connection: ConnectionConfig,
         template_provider: TemplateProviderConfig,
@@ -51,6 +54,8 @@ impl PoolConfig {
         shares_per_minute: SharesPerMinute,
         share_batch_size: SharesBatchSize,
         server_id: u16,
+        supported_extensions: Vec<u16>,
+        required_extensions: Vec<u16>,
     ) -> Self {
         Self {
             listen_address: pool_connection.listen_address,
@@ -65,6 +70,8 @@ impl PoolConfig {
             share_batch_size,
             log_file: None,
             server_id,
+            supported_extensions,
+            required_extensions,
         }
     }
 
@@ -121,6 +128,16 @@ impl PoolConfig {
     /// Returns the shares per minute.
     pub fn shares_per_minute(&self) -> f32 {
         self.shares_per_minute
+    }
+
+    /// Returns the supported extensions.
+    pub fn supported_extensions(&self) -> &[u16] {
+        &self.supported_extensions
+    }
+
+    /// Returns the required extensions.
+    pub fn required_extensions(&self) -> &[u16] {
+        &self.required_extensions
     }
 
     /// Change TP address.

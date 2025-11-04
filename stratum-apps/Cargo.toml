@@ -13,7 +13,7 @@ keywords = ["stratum", "mining", "bitcoin", "protocol", "sv2"]
 
 [dependencies]
 # Core protocol layer
-stratum-core = { git = "https://github.com/stratum-mining/stratum", branch = "main", optional = true}
+stratum-core = { git = "https://github.com/GitGab19/stratum", branch = "extensions-sv2", optional = true}
 
 # External dependencies needed by the modules
 # Network helpers dependencies

@@ -10,7 +10,6 @@ use stratum_apps::{
             Transaction, TxIn, TxOut, Witness,
         },
         codec_sv2::HandshakeRole,
-        framing_sv2,
         handlers_sv2::HandleCommonMessagesFromServerAsync,
         noise_sv2::{Error, Initiator},
         parsers_sv2::{AnyMessage, TemplateDistribution},
@@ -220,27 +219,23 @@ impl TemplateReceiver {
     pub async fn handle_template_provider_message(&mut self) -> PoolResult<()> {
         let mut sv2_frame = self.template_receiver_channel.tp_receiver.recv().await?;
         debug!("Received SV2 frame from Template provider.");
-        let Some(message_type) = sv2_frame.get_header().map(|m| m.msg_type()) else {
-            return Ok(());
-        };
+        let header = sv2_frame.get_header().expect("header must be present");
 
-        match protocol_message_type(message_type) {
+        match protocol_message_type(header.ext_type(), header.msg_type()) {
             MessageType::Common => {
                 info!(
-                    ?message_type,
+                    ext_type = ?header.ext_type(),
+                    msg_type = ?header.msg_type(),
                     "Handling common message from Template provider."
                 );
 
-                self.handle_common_message_frame_from_server(
-                    None,
-                    message_type,
-                    sv2_frame.payload(),
-                )
-                .await?;
+                self.handle_common_message_frame_from_server(None, header, sv2_frame.payload())
+                    .await?;
             }
             MessageType::TemplateDistribution => {
-                let message = TemplateDistribution::try_from((message_type, sv2_frame.payload()))?
-                    .into_static();
+                let message =
+                    TemplateDistribution::try_from((header.msg_type(), sv2_frame.payload()))?
+                        .into_static();
 
                 self.template_receiver_channel
                     .channel_manager_sender
@@ -252,7 +247,11 @@ impl TemplateReceiver {
                     })?;
             }
             _ => {
-                warn!("Received unsupported message type from template provider: {message_type}");
+                warn!(
+                    ext_type = ?header.ext_type(),
+                    msg_type = ?header.msg_type(),
+                    "Received unsupported message type from template provider."
+                );
             }
         }
         Ok(())
@@ -365,13 +364,14 @@ impl TemplateReceiver {
                 PoolError::Noise(Error::ExpectedIncomingHandshakeMessage)
             })?;
 
-        let msg_type = incoming
-            .get_header()
-            .ok_or(framing_sv2::Error::ExpectedHandshakeFrame)?
-            .msg_type();
-        debug!(?msg_type, "Received upstream handshake response");
+        let header = incoming.get_header().expect("header must be present");
+        debug!(
+            ext_type = ?header.ext_type(),
+            msg_type = ?header.msg_type(),
+            "Received upstream handshake response"
+        );
 
-        self.handle_common_message_frame_from_server(None, msg_type, incoming.payload())
+        self.handle_common_message_frame_from_server(None, header, incoming.payload())
             .await?;
         info!("Handshake with upstream completed successfully");
         Ok(())

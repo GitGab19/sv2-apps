@@ -26,7 +26,7 @@ use stratum_apps::{
         },
         mining_sv2::{ExtendedExtranonce, SetTarget},
         noise_sv2::Responder,
-        parsers_sv2::{Mining, TemplateDistribution},
+        parsers_sv2::{Mining, TemplateDistribution, Tlv},
         template_distribution_sv2::{NewTemplate, SetNewPrevHash},
     },
     task_manager::TaskManager,
@@ -77,8 +77,8 @@ pub struct ChannelManagerData {
 pub struct ChannelManagerChannel {
     tp_sender: Sender<TemplateDistribution<'static>>,
     tp_receiver: Receiver<TemplateDistribution<'static>>,
-    downstream_sender: broadcast::Sender<(usize, Mining<'static>)>,
-    downstream_receiver: Receiver<(usize, Mining<'static>)>,
+    downstream_sender: broadcast::Sender<(usize, Mining<'static>, Option<Vec<Tlv>>)>,
+    downstream_receiver: Receiver<(usize, Mining<'static>, Option<Vec<Tlv>>)>,
 }
 
 /// Contains all the state of mutable and immutable data required
@@ -92,6 +92,10 @@ pub struct ChannelManager {
     share_batch_size: usize,
     shares_per_minute: SharesPerMinute,
     coinbase_reward_script: CoinbaseRewardScript,
+    /// Protocol extensions that the pool supports (will accept if requested by clients).
+    supported_extensions: Vec<u16>,
+    /// Protocol extensions that the pool requires (clients must support these).
+    required_extensions: Vec<u16>,
 }
 
 impl ChannelManager {
@@ -101,8 +105,8 @@ impl ChannelManager {
         config: PoolConfig,
         tp_sender: Sender<TemplateDistribution<'static>>,
         tp_receiver: Receiver<TemplateDistribution<'static>>,
-        downstream_sender: broadcast::Sender<(DownstreamId, Mining<'static>)>,
-        downstream_receiver: Receiver<(DownstreamId, Mining<'static>)>,
+        downstream_sender: broadcast::Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
+        downstream_receiver: Receiver<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
         coinbase_outputs: Vec<u8>,
     ) -> PoolResult<Self> {
         let range_0 = 0..0;
@@ -152,6 +156,8 @@ impl ChannelManager {
             shares_per_minute: config.shares_per_minute(),
             pool_tag_string: config.pool_signature().to_string(),
             coinbase_reward_script: config.coinbase_reward_script().clone(),
+            supported_extensions: config.supported_extensions().to_vec(),
+            required_extensions: config.required_extensions().to_vec(),
         };
 
         Ok(channel_manager)
@@ -168,8 +174,12 @@ impl ChannelManager {
         task_manager: Arc<TaskManager>,
         notify_shutdown: broadcast::Sender<ShutdownMessage>,
         status_sender: Sender<Status>,
-        channel_manager_sender: Sender<(DownstreamId, Mining<'static>)>,
-        channel_manager_receiver: broadcast::Sender<(DownstreamId, Mining<'static>)>,
+        channel_manager_sender: Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
+        channel_manager_receiver: broadcast::Sender<(
+            DownstreamId,
+            Mining<'static>,
+            Option<Vec<Tlv>>,
+        )>,
     ) -> PoolResult<()> {
         info!("Starting downstream server at {listening_address}");
         let server = TcpListener::bind(listening_address).await.map_err(|e| {
@@ -238,6 +248,8 @@ impl ChannelManager {
                                     notify_shutdown.clone(),
                                     task_manager_clone.clone(),
                                     status_sender.clone(),
+                                    self.supported_extensions.clone(),
+                                    self.required_extensions.clone(),
                                 );
 
 
@@ -354,20 +366,21 @@ impl ChannelManager {
     // - If the frame contains any unsupported message type, an error is returned.
     async fn handle_template_provider_message(&mut self) -> PoolResult<()> {
         if let Ok(message) = self.channel_manager_channel.tp_receiver.recv().await {
-            self.handle_template_distribution_message_from_server(None, message)
+            self.handle_template_distribution_message_from_server(None, message, None)
                 .await?;
         }
         Ok(())
     }
 
     async fn handle_downstream_mining_message(&mut self) -> PoolResult<()> {
-        if let Ok((downstream_id, message)) = self
+        if let Ok((downstream_id, message, tlv_fields)) = self
             .channel_manager_channel
             .downstream_receiver
             .recv()
             .await
         {
-            self.handle_mining_message_from_client(Some(downstream_id), message)
+            let tlv_slice = tlv_fields.as_deref();
+            self.handle_mining_message_from_client(Some(downstream_id), message, tlv_slice)
                 .await?;
         }
 
@@ -554,9 +567,11 @@ impl RouteMessageTo<'_> {
     pub async fn forward(self, channel_manager_channel: &ChannelManagerChannel) {
         match self {
             RouteMessageTo::Downstream((downstream_id, message)) => {
-                _ = channel_manager_channel
-                    .downstream_sender
-                    .send((downstream_id, message.into_static()));
+                _ = channel_manager_channel.downstream_sender.send((
+                    downstream_id,
+                    message.into_static(),
+                    None,
+                ));
             }
             RouteMessageTo::TemplateProvider(message) => {
                 _ = channel_manager_channel

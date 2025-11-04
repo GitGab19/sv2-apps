@@ -69,7 +69,7 @@ pub enum PoolError {
     /// Shutdown
     Shutdown,
     /// Unexpected message
-    UnexpectedMessage(u8),
+    UnexpectedMessage(u16, u8),
     /// Channel error sender
     ChannelErrorSender,
     /// Invalid socket address
@@ -92,6 +92,12 @@ pub enum PoolError {
     ParseInt(std::num::ParseIntError),
     /// Failed to create group channel
     FailedToCreateGroupChannel(GroupChannelError),
+    /// Invalid unsupported extensions sequence (exceeds maximum length)
+    InvalidUnsupportedExtensionsSequence,
+    /// Invalid required extensions sequence (exceeds maximum length)
+    InvalidRequiredExtensionsSequence,
+    /// Invalid supported extensions sequence (exceeds maximum length)
+    InvalidSupportedExtensionsSequence,
 }
 
 impl std::fmt::Display for PoolError {
@@ -117,7 +123,7 @@ impl std::fmt::Display for PoolError {
             }
             Parser(e) => write!(f, "Parser error: `{e:?}`"),
             Shutdown => write!(f, "Shutdown"),
-            UnexpectedMessage(message_type) => write!(f, "message type: {message_type:?}"),
+            UnexpectedMessage(extension_type, message_type) => write!(f, "Unexpected message: extension type: {extension_type:?}, message type: {message_type:?}"),
             ChannelErrorSender => write!(f, "Channel sender error"),
             InvalidSocketAddress(address) => write!(f, "Invalid socket address: {address:?}"),
             BitcoinEncodeError(_) => write!(f, "Error generated during encoding"),
@@ -141,6 +147,24 @@ impl std::fmt::Display for PoolError {
             }
             FailedToCreateGroupChannel(ref e) => {
                 write!(f, "Failed to create group channel: {e:?}")
+            }
+            InvalidUnsupportedExtensionsSequence => {
+                write!(
+                    f,
+                    "Invalid unsupported extensions sequence (exceeds maximum length)"
+                )
+            }
+            InvalidRequiredExtensionsSequence => {
+                write!(
+                    f,
+                    "Invalid required extensions sequence (exceeds maximum length)"
+                )
+            }
+            InvalidSupportedExtensionsSequence => {
+                write!(
+                    f,
+                    "Invalid supported extensions sequence (exceeds maximum length)"
+                )
             }
         }
     }
@@ -216,8 +240,8 @@ impl HandlerErrorType for PoolError {
         PoolError::Parser(error)
     }
 
-    fn unexpected_message(message_type: u8) -> Self {
-        PoolError::UnexpectedMessage(message_type)
+    fn unexpected_message(extension_type: u16, message_type: u8) -> Self {
+        PoolError::UnexpectedMessage(extension_type, message_type)
     }
 }
 

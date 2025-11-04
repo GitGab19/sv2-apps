@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use async_channel::unbounded;
 use stratum_apps::{
-    stratum_core::{bitcoin::consensus::Encodable, parsers_sv2::TemplateDistribution},
+    stratum_core::{
+        bitcoin::consensus::Encodable,
+        parsers_sv2::{Mining, TemplateDistribution, Tlv},
+    },
     task_manager::TaskManager,
 };
 use tokio::sync::broadcast;
@@ -57,9 +60,9 @@ impl PoolSv2 {
         let (status_sender, status_receiver) = async_channel::unbounded::<Status>();
 
         let (channel_manager_to_downstream_sender, _channel_manager_to_downstream_receiver) =
-            broadcast::channel(10);
+            broadcast::channel::<(usize, Mining<'static>, Option<Vec<Tlv>>)>(10);
         let (downstream_to_channel_manager_sender, downstream_to_channel_manager_receiver) =
-            unbounded();
+            unbounded::<(usize, Mining<'static>, Option<Vec<Tlv>>)>();
 
         let (channel_manager_to_tp_sender, channel_manager_to_tp_receiver) =
             unbounded::<TemplateDistribution<'static>>();

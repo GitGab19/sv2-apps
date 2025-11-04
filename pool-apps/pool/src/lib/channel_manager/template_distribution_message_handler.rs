@@ -1,9 +1,11 @@
 use std::sync::atomic::Ordering;
 
 use stratum_apps::stratum_core::{
-    bitcoin::Amount, channels_sv2::outputs::deserialize_outputs,
+    bitcoin::Amount,
+    channels_sv2::outputs::deserialize_outputs,
     handlers_sv2::HandleTemplateDistributionMessagesFromServerAsync,
-    mining_sv2::SetNewPrevHash as SetNewPrevHashMp, parsers_sv2::Mining,
+    mining_sv2::SetNewPrevHash as SetNewPrevHashMp,
+    parsers_sv2::{Mining, Tlv},
     template_distribution_sv2::*,
 };
 use tracing::{info, warn};
@@ -16,10 +18,15 @@ use crate::{
 impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
     type Error = PoolError;
 
+    fn get_negotiated_extensions_with_server(&self, _server_id: Option<usize>) -> Vec<u16> {
+        vec![]
+    }
+
     async fn handle_new_template(
         &mut self,
         _server_id: Option<usize>,
         msg: NewTemplate<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
@@ -172,6 +179,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         msg: RequestTransactionDataError<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", msg);
         Ok(())
@@ -181,6 +189,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         msg: RequestTransactionDataSuccess<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
         Ok(())
@@ -190,6 +199,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         msg: SetNewPrevHash<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
