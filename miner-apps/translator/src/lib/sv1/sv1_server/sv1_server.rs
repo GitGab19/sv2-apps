@@ -27,8 +27,9 @@ use stratum_apps::{
         binary_sv2::Str0255,
         bitcoin::Target,
         channels_sv2::{target::hash_rate_to_target, Vardiff, VardiffState},
+        extensions_sv2::UserIdentity,
         mining_sv2::{CloseChannel, SetTarget},
-        parsers_sv2::Mining,
+        parsers_sv2::{Mining, Tlv, TlvField},
         stratum_translation::{
             sv1_to_sv2::{
                 build_sv2_open_extended_mining_channel,
@@ -86,8 +87,8 @@ impl Sv1Server {
     /// A new Sv1Server instance ready to accept connections
     pub fn new(
         listener_addr: SocketAddr,
-        channel_manager_receiver: Receiver<Mining<'static>>,
-        channel_manager_sender: Sender<Mining<'static>>,
+        channel_manager_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
+        channel_manager_sender: Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
         config: TranslatorConfig,
     ) -> Self {
         let shares_per_minute = config.downstream_difficulty_config.shares_per_minute;
@@ -203,10 +204,10 @@ impl Sv1Server {
                                             let reason_code =  Str0255::try_from("downstream disconnected".to_string()).unwrap();
                                             _ = self.sv1_server_channel_state
                                                 .channel_manager_sender
-                                                .send(Mining::CloseChannel(CloseChannel {
+                                                .send((Mining::CloseChannel(CloseChannel {
                                                     channel_id,
                                                     reason_code,
-                                                }))
+                                                }), None))
                                                 .await;
                                         }
                                     }
@@ -385,9 +386,30 @@ impl Sv1Server {
         )
         .map_err(|_| TproxyError::SV1Error)?;
 
+        // Only add TLV fields with user identity in non-aggregated mode
+        let tlv_fields = if !self.config.aggregate_channels {
+            let user_identity_string = self.sv1_server_data.super_safe_lock(|d| {
+                d.downstreams
+                    .get(&message.downstream_id)
+                    .unwrap()
+                    .downstream_data
+                    .super_safe_lock(|d| d.user_identity.clone())
+            });
+            UserIdentity::new(&user_identity_string)
+                .unwrap()
+                .to_tlv()
+                .ok()
+                .map(|tlv| vec![tlv])
+        } else {
+            None
+        };
+
         self.sv1_server_channel_state
             .channel_manager_sender
-            .send(Mining::SubmitSharesExtended(submit_share_extended))
+            .send((
+                Mining::SubmitSharesExtended(submit_share_extended),
+                tlv_fields,
+            ))
             .await
             .map_err(|_| TproxyError::ChannelErrorSender)?;
 
@@ -444,7 +466,7 @@ impl Sv1Server {
         self: Arc<Self>,
         first_target: Target,
     ) -> Result<(), TproxyError> {
-        let message = self
+        let (message, _tlv_fields) = self
             .sv1_server_channel_state
             .channel_manager_receiver
             .recv()
@@ -674,7 +696,7 @@ impl Sv1Server {
         ) {
             self.sv1_server_channel_state
                 .channel_manager_sender
-                .send(Mining::OpenExtendedMiningChannel(open_channel_msg))
+                .send((Mining::OpenExtendedMiningChannel(open_channel_msg), None))
                 .await
                 .map_err(|_| TproxyError::ChannelErrorSender)?;
         } else {
@@ -852,7 +874,9 @@ mod tests {
             1,                     // min_supported_version
             4,                     // downstream_extranonce2_size
             "test_user".to_string(),
-            true, // aggregate_channels
+            true,   // aggregate_channels
+            vec![], // supported_extensions
+            vec![], // required_extensions
         )
     }
 

@@ -11,9 +11,10 @@ use stratum_apps::{
     key_utils::Secp256k1PublicKey,
     network_helpers::noise_stream::NoiseTcpStream,
     stratum_core::{
+        binary_sv2::Seq064K,
         codec_sv2::HandshakeRole,
         common_messages_sv2::{Protocol, SetupConnection},
-        framing_sv2,
+        extensions_sv2::RequestExtensions,
         handlers_sv2::HandleCommonMessagesFromServerAsync,
         noise_sv2::Initiator,
         parsers_sv2::{AnyMessage, Mining},
@@ -46,7 +47,9 @@ use tracing::{debug, error, info, warn};
 /// establishment.
 #[derive(Debug, Clone)]
 pub struct Upstream {
-    upstream_channel_state: UpstreamChannelState,
+    pub upstream_channel_state: UpstreamChannelState,
+    /// Extensions that the translator requires (must be supported by server)
+    pub required_extensions: Vec<u16>,
 }
 
 impl Upstream {
@@ -66,13 +69,15 @@ impl Upstream {
     /// # Returns
     /// * `Ok(Upstream)` - Successfully connected to an upstream server
     /// * `Err(TproxyError)` - Failed to connect to any upstream server
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         upstreams: &[(SocketAddr, Secp256k1PublicKey)],
-        channel_manager_sender: Sender<Mining<'static>>,
-        channel_manager_receiver: Receiver<Mining<'static>>,
+        channel_manager_sender: Sender<Sv2Frame>,
+        channel_manager_receiver: Receiver<Sv2Frame>,
         notify_shutdown: broadcast::Sender<ShutdownMessage>,
         shutdown_complete_tx: mpsc::Sender<()>,
         task_manager: Arc<TaskManager>,
+        required_extensions: Vec<u16>,
     ) -> Result<Self, TproxyError> {
         let mut shutdown_rx = notify_shutdown.subscribe();
         const RETRIES_PER_UPSTREAM: u8 = 3;
@@ -112,15 +117,16 @@ impl Upstream {
                                 );
 
                                 let upstream_channel_state = UpstreamChannelState::new(
-                                    channel_manager_sender,
-                                    channel_manager_receiver,
                                     inbound_rx,
                                     outbound_tx,
+                                    channel_manager_sender,
+                                    channel_manager_receiver,
                                 );
                                 debug!("Successfully initialized upstream channel with {addr}");
 
                                 return Ok(Self {
                                     upstream_channel_state,
+                                    required_extensions: required_extensions.clone(),
                                 });
                             }
                             Err(e) => {
@@ -249,19 +255,41 @@ impl Upstream {
                 }
             };
 
-        let message_type = incoming
-            .get_header()
-            .ok_or_else(|| {
-                error!("Expected handshake frame but no header found.");
-                framing_sv2::Error::ExpectedHandshakeFrame
-            })?
-            .msg_type();
+        let header = incoming.get_header().ok_or_else(|| {
+            error!("Expected handshake frame but no header found.");
+            TproxyError::UnexpectedMessage(0, 0)
+        })?;
 
         let payload = incoming.payload();
 
-        self.handle_common_message_frame_from_server(None, message_type, payload)
+        self.handle_common_message_frame_from_server(None, header, payload)
             .await?;
         debug!("Upstream: handshake completed successfully.");
+
+        // Send RequestExtensions message if there are any required extensions
+        if !self.required_extensions.is_empty() {
+            let require_extensions = RequestExtensions {
+                request_id: 0,
+                requested_extensions: Seq064K::new(self.required_extensions.clone()).unwrap(),
+            };
+
+            let sv2_frame: Sv2Frame =
+                AnyMessage::Extensions(require_extensions.into_static().into()).try_into()?;
+
+            info!(
+                "Sending RequestExtensions message to upstream: {:?}",
+                sv2_frame
+            );
+
+            self.upstream_channel_state
+                .upstream_sender
+                .send(sv2_frame)
+                .await
+                .map_err(|e| {
+                    error!("Failed to send message to upstream: {:?}", e);
+                    TproxyError::ChannelErrorSender
+                })?;
+        }
         Ok(())
     }
 
@@ -278,26 +306,24 @@ impl Upstream {
         mut sv2_frame: Sv2Frame,
     ) -> Result<(), TproxyError> {
         debug!("Received SV2 frame from upstream.");
-        let Some(message_type) = sv2_frame.get_header().map(|m| m.msg_type()) else {
-            return Err(TproxyError::UnexpectedMessage(0));
+        let Some(header) = sv2_frame.get_header() else {
+            return Err(TproxyError::UnexpectedMessage(0, 0));
         };
 
-        match protocol_message_type(message_type) {
+        match protocol_message_type(header.ext_type(), header.msg_type()) {
             MessageType::Common => {
-                info!(?message_type, "Handling common message from Upstream.");
-                self.handle_common_message_frame_from_server(
-                    None,
-                    message_type,
-                    sv2_frame.payload(),
-                )
-                .await?;
+                info!(
+                    extension_type = header.ext_type(),
+                    message_type = header.msg_type(),
+                    "Handling common message from Upstream."
+                );
+                self.handle_common_message_frame_from_server(None, header, sv2_frame.payload())
+                    .await?;
             }
-            MessageType::Mining => {
-                let mining_message =
-                    Mining::try_from((message_type, sv2_frame.payload()))?.into_static();
+            MessageType::Mining | MessageType::Extensions => {
                 self.upstream_channel_state
                     .channel_manager_sender
-                    .send(mining_message)
+                    .send(sv2_frame)
                     .await
                     .map_err(|e| {
                         error!("Failed to send mining message to channel manager: {:?}", e);
@@ -305,8 +331,15 @@ impl Upstream {
                     })?;
             }
             _ => {
-                warn!("Received unsupported message type from upstream: {message_type}");
-                return Err(TproxyError::UnexpectedMessage(message_type));
+                warn!(
+                    extension_type = header.ext_type(),
+                    message_type = header.msg_type(),
+                    "Received unsupported message type from upstream."
+                );
+                return Err(TproxyError::UnexpectedMessage(
+                    header.ext_type(),
+                    header.msg_type(),
+                ));
             }
         }
         Ok(())
@@ -364,10 +397,10 @@ impl Upstream {
                     // Handle messages from channel manager to send upstream
                     result = self.upstream_channel_state.channel_manager_receiver.recv() => {
                         match result {
-                            Ok(msg) => {
-                                debug!("Upstream: sending message from channel manager: {:?}", msg);
-                                if let Err(e) = self.send_upstream(msg).await {
-                                    error!("Upstream: failed to send message: {e:?}");
+                            Ok(sv2_frame) => {
+                                debug!("Upstream: sending sv2 frame from channel manager: {:?}", sv2_frame);
+                                if let Err(e) = self.upstream_channel_state.upstream_sender.send(sv2_frame).await {
+                                    error!("Upstream: failed to send sv2 frame: {e:?}");
                                     handle_error(&status_sender, TproxyError::ChannelErrorSender).await;
                                 }
                             }

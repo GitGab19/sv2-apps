@@ -41,6 +41,12 @@ pub struct TranslatorConfig {
     /// Whether to aggregate all downstream connections into a single upstream channel.
     /// If true, all miners share one channel. If false, each miner gets its own channel.
     pub aggregate_channels: bool,
+    /// Protocol extensions that the translator supports (will request if supported by server).
+    pub supported_extensions: Vec<u16>,
+    /// Protocol extensions that the translator requires (server must support these).
+    /// If the upstream server doesn't support these, the translator will fail over to another
+    /// upstream.
+    pub required_extensions: Vec<u16>,
     /// The path to the log file for the Translator.
     log_file: Option<PathBuf>,
 }
@@ -80,6 +86,8 @@ impl TranslatorConfig {
         downstream_extranonce2_size: u16,
         user_identity: String,
         aggregate_channels: bool,
+        supported_extensions: Vec<u16>,
+        required_extensions: Vec<u16>,
     ) -> Self {
         Self {
             upstreams,
@@ -91,6 +99,8 @@ impl TranslatorConfig {
             user_identity,
             downstream_difficulty_config,
             aggregate_channels,
+            supported_extensions,
+            required_extensions,
             log_file: None,
         }
     }
@@ -178,6 +188,8 @@ mod tests {
             4,
             "test_user".to_string(),
             true,
+            vec![],
+            vec![],
         );
 
         assert_eq!(config.upstreams.len(), 1);
@@ -188,6 +200,8 @@ mod tests {
         assert_eq!(config.downstream_extranonce2_size, 4);
         assert_eq!(config.user_identity, "test_user");
         assert!(config.aggregate_channels);
+        assert!(config.supported_extensions.is_empty());
+        assert!(config.required_extensions.is_empty());
         assert!(config.log_file.is_none());
     }
 
@@ -206,6 +220,8 @@ mod tests {
             4,
             "test_user".to_string(),
             false,
+            vec![],
+            vec![],
         );
 
         assert!(config.log_dir().is_none());
@@ -238,6 +254,8 @@ mod tests {
             4,
             "test_user".to_string(),
             true,
+            vec![],
+            vec![],
         );
 
         assert_eq!(config.upstreams.len(), 2);
@@ -263,6 +281,8 @@ mod tests {
             4,
             "test_user".to_string(),
             false,
+            vec![],
+            vec![],
         );
 
         assert!(!config.downstream_difficulty_config.enable_vardiff);

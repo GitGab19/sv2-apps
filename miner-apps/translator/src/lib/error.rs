@@ -53,7 +53,7 @@ pub enum TproxyError {
     /// Error converting SetDifficulty to Message
     SetDifficultyToMessage(SetDifficulty),
     /// Received an unexpected message type
-    UnexpectedMessage(u8),
+    UnexpectedMessage(u16, u8),
     /// Job not found during share validation
     JobNotFound,
     /// Invalid merkle root during share validation
@@ -62,6 +62,10 @@ pub enum TproxyError {
     Shutdown,
     /// Pending channel not found for the given request ID
     PendingChannelNotFound(u32),
+    /// Server does not support required extensions
+    RequiredExtensionsNotSupported(Vec<u16>),
+    /// Server requires extensions that the translator doesn't support
+    ServerRequiresUnsupportedExtensions(Vec<u16>),
     /// Represents a generic channel send failure, described by a string.
     General(String),
     /// Error bubbling up from translator-core library
@@ -95,10 +99,10 @@ impl fmt::Display for TproxyError {
             SetDifficultyToMessage(ref e) => {
                 write!(f, "Error converting SetDifficulty to Message: `{e:?}`")
             }
-            UnexpectedMessage(message_type) => {
+            UnexpectedMessage(extension_type, message_type) => {
                 write!(
                     f,
-                    "Received a message type that was not expected: {message_type}"
+                    "Received a message type that was not expected: {extension_type}, {message_type}"
                 )
             }
             JobNotFound => write!(f, "Job not found during share validation"),
@@ -106,6 +110,20 @@ impl fmt::Display for TproxyError {
             Shutdown => write!(f, "Shutdown signal"),
             PendingChannelNotFound(request_id) => {
                 write!(f, "No pending channel found for request_id: {}", request_id)
+            }
+            RequiredExtensionsNotSupported(extensions) => {
+                write!(
+                    f,
+                    "Server does not support required extensions: {:?}",
+                    extensions
+                )
+            }
+            ServerRequiresUnsupportedExtensions(extensions) => {
+                write!(
+                    f,
+                    "Server requires extensions that we don't support: {:?}",
+                    extensions
+                )
             }
             SV1Error => write!(f, "Sv1 error"),
             TranslatorCore(ref e) => write!(f, "Translator core error: {e:?}"),
@@ -219,7 +237,7 @@ impl HandlerErrorType for TproxyError {
         TproxyError::ParserError(error)
     }
 
-    fn unexpected_message(message_type: u8) -> Self {
-        TproxyError::UnexpectedMessage(message_type)
+    fn unexpected_message(extension_type: u16, message_type: u8) -> Self {
+        TproxyError::UnexpectedMessage(extension_type, message_type)
     }
 }

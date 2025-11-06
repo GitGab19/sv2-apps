@@ -110,6 +110,12 @@ impl IsServer<'static> for DownstreamData {
         if !self.is_authorized(&name) {
             self.authorized_worker_name = name.to_string();
         }
+        // Set user_identity from the authorize request
+        self.user_identity = name.to_string();
+        debug!(
+            "Down: Set user_identity to '{}' for downstream {}",
+            self.user_identity, self.downstream_id
+        );
     }
 
     /// Sets the `extranonce1` field sent in the SV1 `mining.notify` message to the value specified

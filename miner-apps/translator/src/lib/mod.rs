@@ -93,6 +93,7 @@ impl TranslatorSv2 {
             notify_shutdown.clone(),
             shutdown_complete_tx.clone(),
             task_manager.clone(),
+            self.config.required_extensions.clone(),
         )
         .await
         {
@@ -116,6 +117,8 @@ impl TranslatorSv2 {
             } else {
                 ChannelMode::NonAggregated
             },
+            self.config.supported_extensions.clone(),
+            self.config.required_extensions.clone(),
         ));
 
         let downstream_addr = SocketAddr::new(
@@ -198,7 +201,8 @@ impl TranslatorSv2 {
                                     channel_manager_to_upstream_receiver.clone(),
                                     notify_shutdown.clone(),
                                     shutdown_complete_tx.clone(),
-                                    task_manager.clone()
+                                    task_manager.clone(),
+                                    self.config.required_extensions.clone(),
                                 ).await {
                                     Ok(upstream) => {
                                         if let Err(e) = upstream

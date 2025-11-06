@@ -7,7 +7,7 @@ use stratum_apps::{
         bitcoin::Target,
         channels_sv2::{target::hash_rate_to_target, Vardiff},
         mining_sv2::{SetTarget, UpdateChannel},
-        parsers_sv2::Mining,
+        parsers_sv2::{Mining, Tlv},
         stratum_translation::sv2_to_sv1::build_sv1_set_difficulty_from_sv2_target,
         sv1_api::json_rpc,
     },
@@ -47,7 +47,7 @@ impl DifficultyManager {
     /// Every 60 seconds, this method updates the difficulty state for each downstream.
     pub async fn spawn_vardiff_loop(
         sv1_server_data: Arc<Mutex<Sv1ServerData>>,
-        channel_manager_sender: Sender<Mining<'static>>,
+        channel_manager_sender: Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
         sv1_server_to_downstream_sender: broadcast::Sender<(
             ChannelId,
             Option<DownstreamId>,
@@ -98,7 +98,7 @@ impl DifficultyManager {
     async fn handle_vardiff_updates(
         &self,
         sv1_server_data: &Arc<Mutex<Sv1ServerData>>,
-        channel_manager_sender: &Sender<Mining<'static>>,
+        channel_manager_sender: &Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
         sv1_server_to_downstream_sender: &broadcast::Sender<(
             ChannelId,
             Option<DownstreamId>,
@@ -251,7 +251,7 @@ impl DifficultyManager {
                                                                         * new_target,
                                                                         * new_hashrate) */
         sv1_server_data: &Arc<Mutex<Sv1ServerData>>,
-        channel_manager_sender: &Sender<Mining<'static>>,
+        channel_manager_sender: &Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
     ) {
         if self.is_aggregated {
             // Aggregated mode: Send single UpdateChannel with minimum target and total hashrate of
@@ -300,7 +300,7 @@ impl DifficultyManager {
                 );
 
                 if let Err(e) = channel_manager_sender
-                    .send(Mining::UpdateChannel(update_channel))
+                    .send((Mining::UpdateChannel(update_channel), None))
                     .await
                 {
                     error!("Failed to send UpdateChannel message: {:?}", e);
@@ -321,7 +321,7 @@ impl DifficultyManager {
                 );
 
                 if let Err(e) = channel_manager_sender
-                    .send(Mining::UpdateChannel(update_channel))
+                    .send((Mining::UpdateChannel(update_channel), None))
                     .await
                 {
                     error!(
@@ -341,7 +341,7 @@ impl DifficultyManager {
     pub async fn handle_set_target_message(
         set_target: SetTarget<'_>,
         sv1_server_data: &Arc<Mutex<Sv1ServerData>>,
-        channel_manager_sender: &Sender<Mining<'static>>,
+        channel_manager_sender: &Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
         sv1_server_to_downstream_sender: &broadcast::Sender<(
             ChannelId,
             Option<DownstreamId>,
@@ -383,7 +383,7 @@ impl DifficultyManager {
         new_upstream_target: Target,
         channel_id: ChannelId,
         sv1_server_data: &Arc<Mutex<Sv1ServerData>>,
-        _channel_manager_sender: &Sender<Mining<'static>>,
+        _channel_manager_sender: &Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
         sv1_server_to_downstream_sender: &broadcast::Sender<(
             ChannelId,
             Option<DownstreamId>,
@@ -427,7 +427,7 @@ impl DifficultyManager {
         channel_id: ChannelId,
         new_upstream_target: Target,
         sv1_server_data: &Arc<Mutex<Sv1ServerData>>,
-        _channel_manager_sender: &Sender<Mining<'static>>,
+        _channel_manager_sender: &Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
         sv1_server_to_downstream_sender: &broadcast::Sender<(
             ChannelId,
             Option<DownstreamId>,
@@ -570,7 +570,7 @@ impl DifficultyManager {
     /// downstreams.
     pub async fn send_update_channel_on_downstream_state_change(
         sv1_server_data: &Arc<Mutex<Sv1ServerData>>,
-        channel_manager_sender: &Sender<Mining<'static>>,
+        channel_manager_sender: &Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
         is_aggregated: bool,
     ) {
         if !is_aggregated {
@@ -623,7 +623,7 @@ impl DifficultyManager {
             };
 
             if let Err(e) = channel_manager_sender
-                .send(Mining::UpdateChannel(update_channel))
+                .send((Mining::UpdateChannel(update_channel), None))
                 .await
             {
                 error!(
@@ -640,7 +640,7 @@ impl DifficultyManager {
             };
 
             if let Err(e) = channel_manager_sender
-                .send(Mining::UpdateChannel(update_channel))
+                .send((Mining::UpdateChannel(update_channel), None))
                 .await
             {
                 error!(
@@ -698,7 +698,7 @@ mod tests {
         let received_message = receiver
             .try_recv()
             .expect("Should receive UpdateChannel message");
-        if let Mining::UpdateChannel(update_channel) = received_message {
+        if let (Mining::UpdateChannel(update_channel), None) = received_message {
             assert_eq!(update_channel.channel_id, 0);
             assert_eq!(update_channel.nominal_hash_rate, 0.0);
             assert_eq!(update_channel.maximum_target, [0xFF; 32].into());

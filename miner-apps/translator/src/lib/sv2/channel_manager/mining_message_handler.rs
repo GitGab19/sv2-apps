@@ -21,7 +21,7 @@ use stratum_apps::{
             MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR, MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_SUCCESS,
             MESSAGE_TYPE_SET_GROUP_CHANNEL,
         },
-        parsers_sv2::Mining,
+        parsers_sv2::{Mining, Tlv},
     },
     utils::types::DownstreamId,
 };
@@ -38,13 +38,20 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         false
     }
 
+    fn get_negotiated_extensions_with_server(&self, _server_id: Option<usize>) -> Vec<u16> {
+        self.channel_manager_data
+            .super_safe_lock(|data| data.negotiated_extensions.clone())
+    }
+
     async fn handle_open_standard_mining_channel_success(
         &mut self,
         _server_id: Option<usize>,
         m: OpenStandardMiningChannelSuccess<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", m);
         Err(Self::Error::UnexpectedMessage(
+            0,
             MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
         ))
     }
@@ -53,6 +60,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: OpenExtendedMiningChannelSuccess<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         // Check if we have the pending channel data, return error if not
         let (user_identity, nominal_hashrate, downstream_extranonce_len) = self
@@ -233,7 +241,10 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
 
         self.channel_state
             .sv1_server_sender
-            .send(Mining::OpenExtendedMiningChannelSuccess(success.clone()))
+            .send((
+                Mining::OpenExtendedMiningChannelSuccess(success.clone()),
+                None,
+            ))
             .await
             .map_err(|e| {
                 error!("Failed to send OpenExtendedMiningChannelSuccess: {:?}", e);
@@ -247,6 +258,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: OpenMiningChannelError<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", m);
         todo!("OpenMiningChannelError not handled yet");
@@ -256,6 +268,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: UpdateChannelError<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", m);
         Ok(())
@@ -265,6 +278,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: CloseChannel<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", m);
         _ = self.channel_manager_data.safe_lock(|channel_data_manager| {
@@ -283,6 +297,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: SetExtranoncePrefix<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", m);
         warn!("⚠️ Cannot process SetExtranoncePrefix since set_extranonce is not supported for majority of sv1 clients. Ignoring.");
@@ -293,6 +308,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: SubmitSharesSuccess,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {} ✅", m);
         Ok(())
@@ -302,6 +318,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: SubmitSharesError<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {} ❌", m);
         Ok(())
@@ -311,6 +328,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: NewMiningJob<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", m);
         warn!("⚠️ Cannot process NewMiningJob since Translator Proxy supports only extended mining jobs. Ignoring.");
@@ -321,6 +339,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: NewExtendedMiningJob<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", m);
         let mut m_static = m.clone().into_static();
@@ -356,7 +375,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         if !job.is_future() {
             self.channel_state
                 .sv1_server_sender
-                .send(Mining::NewExtendedMiningJob(job))
+                .send((Mining::NewExtendedMiningJob(job), None))
                 .await
                 .map_err(|e| {
                     error!("Failed to send immediate NewExtendedMiningJob: {:?}", e);
@@ -370,6 +389,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: SetNewPrevHash<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", m);
         let m_static = m.clone().into_static();
@@ -400,7 +420,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
 
         self.channel_state
             .sv1_server_sender
-            .send(Mining::SetNewPrevHash(m_static.clone()))
+            .send((Mining::SetNewPrevHash(m_static.clone()), None))
             .await
             .map_err(|e| {
                 error!("Failed to send SetNewPrevHash: {:?}", e);
@@ -433,7 +453,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
             }
             self.channel_state
                 .sv1_server_sender
-                .send(Mining::NewExtendedMiningJob(job))
+                .send((Mining::NewExtendedMiningJob(job), None))
                 .await
                 .map_err(|e| {
                     error!("Failed to send NewExtendedMiningJob: {:?}", e);
@@ -447,10 +467,12 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: SetCustomMiningJobSuccess,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", m);
         warn!("⚠️ Cannot process SetCustomMiningJobSuccess since Translator Proxy does not support custom mining jobs. Ignoring.");
         Err(Self::Error::UnexpectedMessage(
+            0,
             MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_SUCCESS,
         ))
     }
@@ -459,10 +481,12 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: SetCustomMiningJobError<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", m);
         warn!("⚠️ Cannot process SetCustomMiningJobError since Translator Proxy does not support custom mining jobs. Ignoring.");
         Err(Self::Error::UnexpectedMessage(
+            0,
             MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR,
         ))
     }
@@ -471,6 +495,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: SetTarget<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", m);
 
@@ -507,7 +532,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         // Forward SetTarget message to SV1Server for vardiff processing
         self.channel_state
             .sv1_server_sender
-            .send(Mining::SetTarget(m.clone().into_static()))
+            .send((Mining::SetTarget(m.clone().into_static()), None))
             .await
             .map_err(|e| {
                 error!("Failed to forward SetTarget message to SV1Server: {:?}", e);
@@ -521,10 +546,12 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         m: SetGroupChannel<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", m);
         warn!("⚠️ Cannot process SetGroupChannel since Translator Proxy does not support group channels. Ignoring.");
         Err(Self::Error::UnexpectedMessage(
+            0,
             MESSAGE_TYPE_SET_GROUP_CHANNEL,
         ))
     }
