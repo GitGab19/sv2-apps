@@ -11,7 +11,7 @@ async fn propagated_from_jdc_to_tp() {
     start_tracing();
     let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     let current_block_hash = tp.get_best_block_hash().unwrap();
-    let (_pool, pool_addr) = start_pool(Some(tp_addr)).await;
+    let (_pool, pool_addr) = start_pool(Some(tp_addr), vec![], vec![]).await;
     let (_jds, jds_addr) = start_jds(tp.rpc_info());
     let ignore_push_solution =
         IgnoreMessage::new(MessageDirection::ToUpstream, MESSAGE_TYPE_PUSH_SOLUTION);
@@ -23,8 +23,13 @@ async fn propagated_from_jdc_to_tp() {
         None,
     );
     let (jdc_tp_sniffer, jdc_tp_sniffer_addr) = start_sniffer("1", tp_addr, false, vec![], None);
-    let (_jdc, jdc_addr) = start_jdc(&[(pool_addr, jdc_jds_sniffer_addr)], jdc_tp_sniffer_addr);
-    let (_translator, tproxy_addr) = start_sv2_translator(jdc_addr, false).await;
+    let (_jdc, jdc_addr) = start_jdc(
+        &[(pool_addr, jdc_jds_sniffer_addr)],
+        jdc_tp_sniffer_addr,
+        vec![],
+        vec![],
+    );
+    let (_translator, tproxy_addr) = start_sv2_translator(jdc_addr, false, vec![], vec![]).await;
     let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
     jdc_tp_sniffer
         .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SUBMIT_SOLUTION)

@@ -10,10 +10,11 @@ use stratum_apps::stratum_core::{common_messages_sv2::*, mining_sv2::*};
 async fn translate_sv1_to_sv2_successfully() {
     start_tracing();
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (_pool, pool_addr) = start_pool(Some(tp_addr)).await;
+    let (_pool, pool_addr) = start_pool(Some(tp_addr), vec![], vec![]).await;
     let (pool_translator_sniffer, pool_translator_sniffer_addr) =
         start_sniffer("0", pool_addr, false, vec![], None);
-    let (_, tproxy_addr) = start_sv2_translator(pool_translator_sniffer_addr, false).await;
+    let (_, tproxy_addr) =
+        start_sv2_translator(pool_translator_sniffer_addr, false, vec![], vec![]).await;
     let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
     pool_translator_sniffer
         .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)

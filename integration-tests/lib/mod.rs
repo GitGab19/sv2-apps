@@ -67,7 +67,11 @@ pub fn start_sniffer(
     (sniffer, listening_address)
 }
 
-pub async fn start_pool(template_provider_address: Option<SocketAddr>) -> (PoolSv2, SocketAddr) {
+pub async fn start_pool(
+    template_provider_address: Option<SocketAddr>,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
+) -> (PoolSv2, SocketAddr) {
     use pool_sv2::config::PoolConfig;
     let listening_address = get_available_address();
     let authority_public_key = Secp256k1PublicKey::try_from(
@@ -106,6 +110,8 @@ pub async fn start_pool(template_provider_address: Option<SocketAddr>) -> (PoolS
         SHARES_PER_MINUTE,
         share_batch_size,
         1,
+        supported_extensions,
+        required_extensions,
     );
     let pool = PoolSv2::new(config);
     let pool_clone = pool.clone();
@@ -130,6 +136,8 @@ pub fn start_template_provider(
 pub fn start_jdc(
     pool: &[(SocketAddr, SocketAddr)], // (pool_address, jds_address)
     tp_address: SocketAddr,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
 ) -> (JobDeclaratorClient, SocketAddr) {
     use jd_client_sv2::config::{
         JobDeclaratorClientConfig, PoolConfig, ProtocolConfig, TPConfig, Upstream,
@@ -187,6 +195,8 @@ pub fn start_jdc(
         upstreams,
         jdc_signature,
         None,
+        supported_extensions,
+        required_extensions,
     );
     let ret = jd_client_sv2::JobDeclaratorClient::new(jd_client_proxy);
     let ret_clone = ret.clone();
@@ -247,6 +257,8 @@ pub fn start_jds(tp_rpc_connection: &ConnectParams) -> (JobDeclaratorServer, Soc
 pub async fn start_sv2_translator(
     upstream: SocketAddr,
     aggregate_channels: bool,
+    supported_extensions: Vec<u16>,
+    required_extensions: Vec<u16>,
 ) -> (TranslatorSv2, SocketAddr) {
     let upstream_address = upstream.ip().to_string();
     let upstream_port = upstream.port();
@@ -284,6 +296,8 @@ pub async fn start_sv2_translator(
         downstream_extranonce2_size,
         "user_identity".to_string(),
         aggregate_channels,
+        supported_extensions,
+        required_extensions,
     );
     let translator_v2 = translator_sv2::TranslatorSv2::new(config);
     let clone_translator_v2 = translator_v2.clone();

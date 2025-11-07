@@ -239,14 +239,13 @@ pub fn message_from_frame(frame: &mut MessageFrame) -> (MsgType, AnyMessage<'sta
     match frame {
         Frame::Sv2(frame) => {
             if let Some(header) = frame.get_header() {
-                let message_type = header.msg_type();
                 let mut payload = frame.payload().to_vec();
                 let message: Result<AnyMessage<'_>, _> =
-                    (message_type, payload.as_mut_slice()).try_into();
+                    (header, payload.as_mut_slice()).try_into();
                 match message {
                     Ok(message) => {
                         let message = into_static(message);
-                        (message_type, message)
+                        (header.msg_type(), message)
                     }
                     _ => {
                         println!("Received frame with invalid payload or message type: {frame:?}");
@@ -334,6 +333,7 @@ pub fn into_static(m: AnyMessage<'_>) -> AnyMessage<'static> {
                 TemplateDistribution::SubmitSolution(m.into_static()),
             ),
         },
+        AnyMessage::Extensions(extensions) => AnyMessage::Extensions(extensions.into_static()),
     }
 }
 

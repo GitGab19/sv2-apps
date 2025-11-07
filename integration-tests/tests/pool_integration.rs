@@ -18,7 +18,7 @@ async fn success_pool_template_provider_connection() {
     start_tracing();
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     let (sniffer, sniffer_addr) = start_sniffer("", tp_addr, true, vec![], None);
-    let _ = start_pool(Some(sniffer_addr)).await;
+    let _ = start_pool(Some(sniffer_addr), vec![], vec![]).await;
     // here we assert that the downstream(pool in this case) have sent `SetupConnection` message
     // with the correct parameters, protocol, flags, min_version and max_version.  Note that the
     // macro can take any number of arguments after the message argument, but the order is
@@ -95,7 +95,7 @@ async fn header_timestamp_value_assertion_in_new_extended_mining_job() {
         "header_timestamp_value_assertion_in_new_extended_mining_job tp_pool sniffer";
     let (tp_pool_sniffer, tp_pool_sniffer_addr) =
         start_sniffer(tp_pool_sniffer_identifier, tp_addr, false, vec![], None);
-    let (_pool, pool_addr) = start_pool(Some(tp_pool_sniffer_addr)).await;
+    let (_pool, pool_addr) = start_pool(Some(tp_pool_sniffer_addr), vec![], vec![]).await;
     let pool_translator_sniffer_identifier =
         "header_timestamp_value_assertion_in_new_extended_mining_job pool_translator sniffer";
     let (pool_translator_sniffer, pool_translator_sniffer_addr) = start_sniffer(
@@ -112,7 +112,8 @@ async fn header_timestamp_value_assertion_in_new_extended_mining_job() {
         ],
         None,
     );
-    let (_tproxy, tproxy_addr) = start_sv2_translator(pool_translator_sniffer_addr, false).await;
+    let (_tproxy, tproxy_addr) =
+        start_sv2_translator(pool_translator_sniffer_addr, false, vec![], vec![]).await;
     let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
 
     tp_pool_sniffer
@@ -176,7 +177,7 @@ async fn header_timestamp_value_assertion_in_new_extended_mining_job() {
 async fn pool_standard_channel_receives_share() {
     start_tracing();
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (_pool, pool_addr) = start_pool(Some(tp_addr)).await;
+    let (_pool, pool_addr) = start_pool(Some(tp_addr), vec![], vec![]).await;
     let (sniffer, sniffer_addr) = start_sniffer("A", pool_addr, false, vec![], None);
     start_mining_device_sv2(sniffer_addr, None, None, None, 1, None, true);
     sniffer

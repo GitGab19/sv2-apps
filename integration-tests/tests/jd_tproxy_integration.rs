@@ -5,14 +5,20 @@ use stratum_apps::stratum_core::{common_messages_sv2::*, mining_sv2::*};
 async fn jd_non_aggregated_tproxy_integration() {
     start_tracing();
     let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (_pool, pool_addr) = start_pool(Some(tp_addr)).await;
+    let (_pool, pool_addr) = start_pool(Some(tp_addr), vec![], vec![]).await;
     let (jdc_pool_sniffer, jdc_pool_sniffer_addr) =
         start_sniffer("0", pool_addr, false, vec![], None);
     let (_jds, jds_addr) = start_jds(tp.rpc_info());
-    let (_jdc, jdc_addr) = start_jdc(&[(jdc_pool_sniffer_addr, jds_addr)], tp_addr);
+    let (_jdc, jdc_addr) = start_jdc(
+        &[(jdc_pool_sniffer_addr, jds_addr)],
+        tp_addr,
+        vec![],
+        vec![],
+    );
     let (tproxy_jdc_sniffer, tproxy_jdc_sniffer_addr) =
         start_sniffer("1", jdc_addr, false, vec![], None);
-    let (_translator, tproxy_addr) = start_sv2_translator(tproxy_jdc_sniffer_addr, false).await;
+    let (_translator, tproxy_addr) =
+        start_sv2_translator(tproxy_jdc_sniffer_addr, false, vec![], vec![]).await;
 
     // start two minerd processes
     let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
@@ -74,14 +80,20 @@ async fn jd_non_aggregated_tproxy_integration() {
 async fn jd_aggregated_tproxy_integration() {
     start_tracing();
     let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
-    let (_pool, pool_addr) = start_pool(Some(tp_addr)).await;
+    let (_pool, pool_addr) = start_pool(Some(tp_addr), vec![], vec![]).await;
     let (jdc_pool_sniffer, jdc_pool_sniffer_addr) =
         start_sniffer("0", pool_addr, false, vec![], None);
     let (_jds, jds_addr) = start_jds(tp.rpc_info());
-    let (_jdc, jdc_addr) = start_jdc(&[(jdc_pool_sniffer_addr, jds_addr)], tp_addr);
+    let (_jdc, jdc_addr) = start_jdc(
+        &[(jdc_pool_sniffer_addr, jds_addr)],
+        tp_addr,
+        vec![],
+        vec![],
+    );
     let (tproxy_jdc_sniffer, tproxy_jdc_sniffer_addr) =
         start_sniffer("1", jdc_addr, false, vec![], None);
-    let (_translator, tproxy_addr) = start_sv2_translator(tproxy_jdc_sniffer_addr, true).await;
+    let (_translator, tproxy_addr) =
+        start_sv2_translator(tproxy_jdc_sniffer_addr, true, vec![], vec![]).await;
 
     // start two minerd processes
     let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
