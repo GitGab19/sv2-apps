@@ -1,17 +1,20 @@
-use stratum_apps::stratum_core::{
-    binary_sv2::{self, Sv2DataType, B016M},
-    bitcoin::{
-        self, absolute::LockTime, transaction::Version, OutPoint, ScriptBuf, Sequence, Transaction,
-        TxIn, TxOut, Witness,
+use stratum_apps::{
+    stratum_core::{
+        binary_sv2::{self, Sv2DataType, B016M},
+        bitcoin::{
+            self, absolute::LockTime, transaction::Version, OutPoint, ScriptBuf, Sequence,
+            Transaction, TxIn, TxOut, Witness,
+        },
+        channels_sv2::outputs::deserialize_outputs,
+        handlers_sv2::HandleJobDeclarationMessagesFromServerAsync,
+        job_declaration_sv2::{
+            AllocateMiningJobTokenSuccess, DeclareMiningJobError, DeclareMiningJobSuccess,
+            ProvideMissingTransactions, ProvideMissingTransactionsSuccess,
+        },
+        parsers_sv2::{AnyMessage, JobDeclaration, Mining, TemplateDistribution, Tlv},
+        template_distribution_sv2::CoinbaseOutputConstraints,
     },
-    channels_sv2::outputs::deserialize_outputs,
-    handlers_sv2::HandleJobDeclarationMessagesFromServerAsync,
-    job_declaration_sv2::{
-        AllocateMiningJobTokenSuccess, DeclareMiningJobError, DeclareMiningJobSuccess,
-        ProvideMissingTransactions, ProvideMissingTransactionsSuccess,
-    },
-    parsers_sv2::{JobDeclaration, Mining, TemplateDistribution},
-    template_distribution_sv2::CoinbaseOutputConstraints,
+    utils::types::Sv2Frame,
 };
 use tracing::{debug, error, info, warn};
 
@@ -23,6 +26,11 @@ use crate::{
 
 impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
     type Error = JDCError;
+
+    fn get_negotiated_extensions_with_server(&self, _server_id: Option<usize>) -> Vec<u16> {
+        self.channel_manager_data
+            .super_safe_lock(|data| data.negotiated_extensions.clone())
+    }
 
     // Handles a successful `AllocateMiningJobToken` response from the JDS.
     //
@@ -37,6 +45,7 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         msg: AllocateMiningJobTokenSuccess<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
@@ -114,6 +123,7 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         msg: DeclareMiningJobError<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", msg);
         warn!("⚠️ JDS refused the declared job with a DeclareMiningJobError ❌. Starting fallback mechanism.");
@@ -148,6 +158,7 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         msg: DeclareMiningJobSuccess<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
@@ -205,10 +216,10 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
 
         debug!("Sending SetCustomMiningJob to the upstream with channel_id: {channel_id}");
         let message = Mining::SetCustomMiningJob(custom_job).into_static();
-
+        let sv2_frame: Sv2Frame = AnyMessage::Mining(message).try_into()?;
         self.channel_manager_channel
             .upstream_sender
-            .send(message)
+            .send(sv2_frame)
             .await
             .map_err(|_e| JDCError::ChannelErrorSender)?;
 
@@ -228,6 +239,7 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         msg: ProvideMissingTransactions<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         let request_id = msg.request_id;
 

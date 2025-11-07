@@ -17,11 +17,9 @@ use stratum_apps::{
     key_utils::Secp256k1PublicKey,
     network_helpers::noise_stream::NoiseTcpStream,
     stratum_core::{
-        codec_sv2::HandshakeRole,
-        framing_sv2,
-        handlers_sv2::HandleCommonMessagesFromServerAsync,
-        noise_sv2::Initiator,
-        parsers_sv2::{AnyMessage, Mining},
+        binary_sv2::Seq064K, codec_sv2::HandshakeRole, extensions_sv2::RequestExtensions,
+        handlers_sv2::HandleCommonMessagesFromServerAsync, noise_sv2::Initiator,
+        parsers_sv2::AnyMessage,
     },
     task_manager::TaskManager,
     utils::{
@@ -55,8 +53,8 @@ pub struct UpstreamData;
 /// - `inbound_rx` → receives frames inbound from upstream
 #[derive(Clone)]
 pub struct UpstreamChannel {
-    channel_manager_sender: Sender<Mining<'static>>,
-    channel_manager_receiver: Receiver<Mining<'static>>,
+    channel_manager_sender: Sender<Sv2Frame>,
+    channel_manager_receiver: Receiver<Sv2Frame>,
     upstream_sender: Sender<Sv2Frame>,
     upstream_receiver: Receiver<Sv2Frame>,
 }
@@ -69,6 +67,8 @@ pub struct Upstream {
     upstream_data: Arc<Mutex<UpstreamData>>,
     /// Messaging channels to/from the channel manager and Upstream.
     upstream_channel: UpstreamChannel,
+    /// Protocol extensions that the JDC requires
+    required_extensions: Vec<u16>,
 }
 
 impl Upstream {
@@ -78,11 +78,12 @@ impl Upstream {
     /// - Spawns IO tasks to handle inbound/outbound traffic
     pub async fn new(
         upstreams: &(SocketAddr, SocketAddr, Secp256k1PublicKey, bool),
-        channel_manager_sender: Sender<Mining<'static>>,
-        channel_manager_receiver: Receiver<Mining<'static>>,
+        channel_manager_sender: Sender<Sv2Frame>,
+        channel_manager_receiver: Receiver<Sv2Frame>,
         notify_shutdown: broadcast::Sender<ShutdownMessage>,
         task_manager: Arc<TaskManager>,
         status_sender: Sender<Status>,
+        required_extensions: Vec<u16>,
     ) -> Result<Self, JDCError> {
         let (addr, _, pubkey, _) = upstreams;
         let stream = tokio::time::timeout(
@@ -123,6 +124,7 @@ impl Upstream {
         Ok(Upstream {
             upstream_data,
             upstream_channel,
+            required_extensions,
         })
     }
 
@@ -165,14 +167,58 @@ impl Upstream {
         let mut incoming: Sv2Frame = incoming_frame;
         debug!(?incoming, "Decoded inbound handshake frame");
 
-        let message_type = incoming
-            .get_header()
-            .ok_or(framing_sv2::Error::ExpectedHandshakeFrame)?
-            .msg_type();
+        let header = incoming.get_header().expect("header must be present");
 
-        info!(?message_type, "Dispatching inbound handshake message");
-        self.handle_common_message_frame_from_server(None, message_type, incoming.payload())
+        info!(ext_type = ?header.ext_type(), msg_type = ?header.msg_type(), "Dispatching inbound handshake message");
+        self.handle_common_message_frame_from_server(None, header, incoming.payload())
             .await?;
+
+        // Send RequestExtensions after successful SetupConnection if there are required extensions
+        if !self.required_extensions.is_empty() {
+            self.send_request_extensions().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Send `RequestExtensions` message to upstream.
+    /// The supported extensions are stored for potential retry if the server requires additional
+    /// extensions.
+    async fn send_request_extensions(&mut self) -> Result<(), JDCError> {
+        info!(
+            "Sending RequestExtensions to upstream with required extensions: {:?}",
+            self.required_extensions
+        );
+        if self.required_extensions.is_empty() {
+            return Ok(());
+        }
+
+        let requested_extensions =
+            Seq064K::new(self.required_extensions.clone()).map_err(JDCError::BinarySv2)?;
+
+        let request_extensions = RequestExtensions {
+            request_id: 0,
+            requested_extensions,
+        };
+
+        info!(
+            "Sending RequestExtensions to upstream with required extensions: {:?}",
+            self.required_extensions
+        );
+
+        let sv2_frame: Sv2Frame =
+            AnyMessage::Extensions(request_extensions.into_static().into()).try_into()?;
+
+        self.upstream_channel
+            .upstream_sender
+            .send(sv2_frame)
+            .await
+            .map_err(|e| {
+                error!(?e, "Failed to send RequestExtensions to upstream");
+                JDCError::ChannelErrorSender
+            })?;
+
+        info!("Sent RequestExtensions to upstream");
         Ok(())
     }
 
@@ -237,14 +283,14 @@ impl Upstream {
                             _ => {}
                         }
                     }
-                    res = self_clone_1.handle_pool_message() => {
+                    res = self_clone_1.handle_pool_message_frame() => {
                         if let Err(e) = res {
                             error!(error = ?e, "Upstream: error handling pool message.");
                             handle_error(&status_sender, e).await;
                             break;
                         }
                     }
-                    res = self_clone_2.handle_channel_manager_message() => {
+                    res = self_clone_2.handle_channel_manager_message_frame() => {
                         if let Err(e) = res {
                             error!(error = ?e, "Upstream: error handling channel manager message.");
                             handle_error(&status_sender, e).await;
@@ -265,29 +311,23 @@ impl Upstream {
     // - `Common` messages → handled locally
     // - `Mining` messages → forwarded to channel manager
     // - Unsupported → error
-    async fn handle_pool_message(&mut self) -> Result<(), JDCError> {
-        let mut sv2_frame = self.upstream_channel.upstream_receiver.recv().await?;
-
+    async fn handle_pool_message_frame(&mut self) -> Result<(), JDCError> {
         debug!("Received SV2 frame from upstream.");
-        let Some(message_type) = sv2_frame.get_header().map(|m| m.msg_type()) else {
-            return Ok(());
-        };
+        let mut sv2_frame = self.upstream_channel.upstream_receiver.recv().await?;
+        let header = sv2_frame.get_header().expect("header must be present");
+        let message_type = header.msg_type();
+        let extension_type = header.ext_type();
 
-        match protocol_message_type(message_type) {
+        match protocol_message_type(extension_type, message_type) {
             MessageType::Common => {
-                info!(?message_type, "Handling common message from Upstream.");
-                self.handle_common_message_frame_from_server(
-                    None,
-                    message_type,
-                    sv2_frame.payload(),
-                )
-                .await?;
+                info!(ext_type = ?extension_type, msg_type = ?message_type, "Handling common message from Upstream.");
+                self.handle_common_message_frame_from_server(None, header, sv2_frame.payload())
+                    .await?;
             }
-            MessageType::Mining => {
-                let message = Mining::try_from((message_type, sv2_frame.payload()))?.into_static();
+            MessageType::Mining | MessageType::Extensions => {
                 self.upstream_channel
                     .channel_manager_sender
-                    .send(message)
+                    .send(sv2_frame)
                     .await
                     .map_err(|e| {
                         error!(error=?e, "Failed to send mining message to channel manager.");
@@ -304,18 +344,16 @@ impl Upstream {
     // Handle outbound frames from channel manager → upstream.
     //
     // Forwards messages upstream.
-    async fn handle_channel_manager_message(&mut self) -> Result<(), JDCError> {
+    async fn handle_channel_manager_message_frame(&mut self) -> Result<(), JDCError> {
         match self.upstream_channel.channel_manager_receiver.recv().await {
-            Ok(msg) => {
-                let message = AnyMessage::Mining(msg);
-                let sv2_frame: Sv2Frame = message.try_into()?;
-                debug!("Received message from channel manager, forwarding upstream.");
+            Ok(sv2_frame) => {
+                debug!("Received sv2 frame from channel manager, forwarding upstream.");
                 self.upstream_channel
                     .upstream_sender
                     .send(sv2_frame)
                     .await
                     .map_err(|e| {
-                        error!(error=?e, "Failed to send outbound message to upstream.");
+                        error!(error=?e, "Failed to send sv2 frame to upstream.");
                         JDCError::CodecNoise(
                             stratum_apps::stratum_core::noise_sv2::Error::ExpectedIncomingHandshakeMessage,
                         )

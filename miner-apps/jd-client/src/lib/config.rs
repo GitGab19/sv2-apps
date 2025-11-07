@@ -48,6 +48,10 @@ pub struct JobDeclaratorClientConfig {
     /// JDC mode: FullTemplate or CoinbaseOnly
     #[serde(deserialize_with = "deserialize_jdc_mode", default)]
     pub mode: ConfigJDCMode,
+    /// Protocol extensions that the JDC supports (will accept if requested by downstream clients).
+    supported_extensions: Vec<u16>,
+    /// Protocol extensions that the JDC requires (downstream clients must support these).
+    required_extensions: Vec<u16>,
 }
 
 impl JobDeclaratorClientConfig {
@@ -63,6 +67,8 @@ impl JobDeclaratorClientConfig {
         upstreams: Vec<Upstream>,
         jdc_signature: String,
         jdc_mode: Option<String>,
+        supported_extensions: Vec<u16>,
+        required_extensions: Vec<u16>,
     ) -> Self {
         Self {
             listening_address,
@@ -83,6 +89,8 @@ impl JobDeclaratorClientConfig {
             mode: jdc_mode
                 .map(|s| s.parse::<ConfigJDCMode>().unwrap_or_default())
                 .unwrap_or_default(),
+            supported_extensions,
+            required_extensions,
         }
     }
 
@@ -163,6 +171,16 @@ impl JobDeclaratorClientConfig {
 
     pub fn share_batch_size(&self) -> SharesBatchSize {
         self.share_batch_size
+    }
+
+    /// Returns the supported extensions.
+    pub fn supported_extensions(&self) -> &Vec<u16> {
+        &self.supported_extensions
+    }
+
+    /// Returns the required extensions.
+    pub fn required_extensions(&self) -> &Vec<u16> {
+        &self.required_extensions
     }
 }
 

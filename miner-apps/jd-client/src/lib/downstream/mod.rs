@@ -15,14 +15,11 @@ use stratum_apps::{
             standard::StandardChannel,
         },
         common_messages_sv2::MESSAGE_TYPE_SETUP_CONNECTION,
-        handlers_sv2::HandleCommonMessagesFromClientAsync,
-        parsers_sv2::{AnyMessage, Mining},
+        handlers_sv2::{HandleCommonMessagesFromClientAsync, HandleExtensionsFromClientAsync},
+        parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage, Mining, Tlv},
     },
     task_manager::TaskManager,
-    utils::{
-        protocol_message_type::{protocol_message_type, MessageType},
-        types::{DownstreamId, Message, Sv2Frame},
-    },
+    utils::types::{DownstreamId, Message, Sv2Frame},
 };
 
 use tokio::sync::broadcast;
@@ -37,7 +34,8 @@ use crate::{
 
 use stratum_apps::utils::types::ChannelId;
 
-mod message_handler;
+mod common_message_handler;
+mod extensions_message_handler;
 
 /// Holds state related to a downstream connection's mining channels.
 ///
@@ -54,6 +52,12 @@ pub struct DownstreamData {
     pub standard_channels:
         HashMap<ChannelId, StandardChannel<'static, DefaultJobStore<StandardJob<'static>>>>,
     pub channel_id_factory: AtomicU32,
+    /// Extensions that have been successfully negotiated with this client
+    pub negotiated_extensions: Vec<u16>,
+    /// Extensions that the JDC supports
+    pub supported_extensions: Vec<u16>,
+    /// Extensions that the JDC requires
+    pub required_extensions: Vec<u16>,
 }
 
 /// Communication layer for a downstream connection.
@@ -66,8 +70,8 @@ pub struct DownstreamData {
 /// - `downstream_receiver`: receives frames from the downstream.
 #[derive(Clone)]
 pub struct DownstreamChannel {
-    channel_manager_sender: Sender<(DownstreamId, Mining<'static>)>,
-    channel_manager_receiver: broadcast::Sender<(DownstreamId, Mining<'static>)>,
+    channel_manager_sender: Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
+    channel_manager_receiver: broadcast::Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
     downstream_sender: Sender<Sv2Frame>,
     downstream_receiver: Receiver<Sv2Frame>,
 }
@@ -82,14 +86,21 @@ pub struct Downstream {
 
 impl Downstream {
     /// Creates a new [`Downstream`] instance and spawns the necessary I/O tasks.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         downstream_id: DownstreamId,
-        channel_manager_sender: Sender<(DownstreamId, Mining<'static>)>,
-        channel_manager_receiver: broadcast::Sender<(DownstreamId, Mining<'static>)>,
+        channel_manager_sender: Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
+        channel_manager_receiver: broadcast::Sender<(
+            DownstreamId,
+            Mining<'static>,
+            Option<Vec<Tlv>>,
+        )>,
         noise_stream: NoiseTcpStream<Message>,
         notify_shutdown: broadcast::Sender<ShutdownMessage>,
         task_manager: Arc<TaskManager>,
         status_sender: Sender<Status>,
+        supported_extensions: Vec<u16>,
+        required_extensions: Vec<u16>,
     ) -> Self {
         let (noise_stream_reader, noise_stream_writer) = noise_stream.into_split();
         let status_sender = StatusSender::Downstream {
@@ -120,6 +131,9 @@ impl Downstream {
             standard_channels: HashMap::new(),
             group_channels: None,
             channel_id_factory: AtomicU32::new(0),
+            negotiated_extensions: vec![],
+            supported_extensions,
+            required_extensions,
         }));
         Downstream {
             downstream_channel,
@@ -206,24 +220,24 @@ impl Downstream {
     // Performs the initial handshake with a downstream peer.
     async fn setup_connection_with_downstream(&mut self) -> Result<(), JDCError> {
         let mut frame = self.downstream_channel.downstream_receiver.recv().await?;
-
-        let Some(message_type) = frame.get_header().map(|m| m.msg_type()) else {
-            return Err(JDCError::UnexpectedMessage(0));
-        };
-        if message_type == MESSAGE_TYPE_SETUP_CONNECTION {
-            self.handle_common_message_frame_from_client(None, message_type, frame.payload())
+        let header = frame.get_header().expect("frame header must be present");
+        if header.msg_type() == MESSAGE_TYPE_SETUP_CONNECTION {
+            self.handle_common_message_frame_from_client(None, header, frame.payload())
                 .await?;
             return Ok(());
         }
-        Err(JDCError::UnexpectedMessage(message_type))
+        Err(JDCError::UnexpectedMessage(
+            header.ext_type(),
+            header.msg_type(),
+        ))
     }
 
     // Handles messages sent from the channel manager to this downstream.
     async fn handle_channel_manager_message(
         self,
-        receiver: &mut broadcast::Receiver<(DownstreamId, Mining<'static>)>,
+        receiver: &mut broadcast::Receiver<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
     ) -> Result<(), JDCError> {
-        let (downstream_id, message) = match receiver.recv().await {
+        let (downstream_id, message, _tlv_fields) = match receiver.recv().await {
             Ok(msg) => msg,
             Err(e) => {
                 warn!(?e, "Broadcast receive failed");
@@ -257,34 +271,40 @@ impl Downstream {
     }
 
     // Handles incoming messages from the downstream peer.
-    async fn handle_downstream_message(self) -> Result<(), JDCError> {
+    async fn handle_downstream_message(mut self) -> Result<(), JDCError> {
         let mut sv2_frame = self.downstream_channel.downstream_receiver.recv().await?;
-
-        let Some(message_type) = sv2_frame.get_header().map(|h| h.msg_type()) else {
-            return Ok(());
-        };
-
-        if protocol_message_type(message_type) != MessageType::Mining {
-            warn!(
-                ?message_type,
-                "Received unsupported message type from downstream."
-            );
-            return Ok(());
+        let header = sv2_frame
+            .get_header()
+            .expect("frame header must be present");
+        let payload = sv2_frame.payload();
+        let negotiated_extensions = self
+            .downstream_data
+            .super_safe_lock(|data| data.negotiated_extensions.clone());
+        let (any_message, tlv_fields) =
+            parse_message_frame_with_tlvs(header, payload, &negotiated_extensions)?;
+        match any_message {
+            AnyMessage::Mining(message) => {
+                self.downstream_channel
+                    .channel_manager_sender
+                    .send((self.downstream_id, message, tlv_fields))
+                    .await
+                    .map_err(|e| {
+                        error!(?e, "Failed to send mining message to channel manager.");
+                        JDCError::ChannelErrorSender
+                    })?;
+            }
+            AnyMessage::Extensions(message) => {
+                self.handle_extensions_message_from_client(None, message, tlv_fields.as_deref())
+                    .await?;
+            }
+            _ => {
+                warn!(
+                    "Received unsupported message type from downstream: {}",
+                    header.msg_type()
+                );
+                return Ok(());
+            }
         }
-
-        let message = Mining::try_from((message_type, sv2_frame.payload()))?.into_static();
-
-        debug!("Received mining SV2 frame from downstream.");
-
-        self.downstream_channel
-            .channel_manager_sender
-            .send((self.downstream_id, message))
-            .await
-            .map_err(|e| {
-                error!(error=?e, "Failed to send mining message to channel manager.");
-                JDCError::ChannelErrorSender
-            })?;
-
         Ok(())
     }
 }

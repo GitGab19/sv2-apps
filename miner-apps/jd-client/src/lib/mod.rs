@@ -3,11 +3,9 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use async_channel::{unbounded, Receiver, Sender};
 use stratum_apps::{
     key_utils::Secp256k1PublicKey,
-    stratum_core::{
-        bitcoin::consensus::Encodable,
-        parsers_sv2::{JobDeclaration, Mining},
-    },
+    stratum_core::{bitcoin::consensus::Encodable, parsers_sv2::JobDeclaration},
     task_manager::TaskManager,
+    utils::types::Sv2Frame,
 };
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
@@ -103,6 +101,8 @@ impl JobDeclaratorClient {
             downstream_to_channel_manager_receiver,
             status_sender.clone(),
             encoded_outputs.clone(),
+            self.config.supported_extensions().clone(),
+            self.config.required_extensions().clone(),
         )
         .await
         .unwrap();
@@ -226,6 +226,8 @@ impl JobDeclaratorClient {
                 status_sender.clone(),
                 downstream_to_channel_manager_sender.clone(),
                 channel_manager_to_downstream_sender.clone(),
+                self.config.supported_extensions().clone(),
+                self.config.required_extensions().clone(),
             )
             .await;
 
@@ -330,6 +332,8 @@ impl JobDeclaratorClient {
                                         status_sender.clone(),
                                         downstream_to_channel_manager_sender.clone(),
                                         channel_manager_to_downstream_sender.clone(),
+                                        self.config.supported_extensions().clone(),
+                                        self.config.required_extensions().clone(),
                                     )
                                     .await;
                                 }
@@ -352,8 +356,8 @@ impl JobDeclaratorClient {
     pub async fn initialize_jd(
         &self,
         upstreams: &mut [(SocketAddr, SocketAddr, Secp256k1PublicKey, bool)],
-        channel_manager_to_upstream_receiver: Receiver<Mining<'static>>,
-        upstream_to_channel_manager_sender: Sender<Mining<'static>>,
+        channel_manager_to_upstream_receiver: Receiver<Sv2Frame>,
+        upstream_to_channel_manager_sender: Sender<Sv2Frame>,
         channel_manager_to_jd_receiver: Receiver<JobDeclaration<'static>>,
         jd_to_channel_manager_sender: Sender<JobDeclaration<'static>>,
         notify_shutdown: broadcast::Sender<ShutdownMessage>,
@@ -393,6 +397,7 @@ impl JobDeclaratorClient {
                     status_sender.clone(),
                     mode.clone(),
                     task_manager.clone(),
+                    &self.config,
                 )
                 .await
                 {
@@ -431,14 +436,15 @@ impl JobDeclaratorClient {
 #[allow(clippy::too_many_arguments)]
 async fn try_initialize_single(
     upstream_addr: &(SocketAddr, SocketAddr, Secp256k1PublicKey, bool),
-    upstream_to_channel_manager_sender: Sender<Mining<'static>>,
-    channel_manager_to_upstream_receiver: Receiver<Mining<'static>>,
+    upstream_to_channel_manager_sender: Sender<Sv2Frame>,
+    channel_manager_to_upstream_receiver: Receiver<Sv2Frame>,
     jd_to_channel_manager_sender: Sender<JobDeclaration<'static>>,
     channel_manager_to_jd_receiver: Receiver<JobDeclaration<'static>>,
     notify_shutdown: broadcast::Sender<ShutdownMessage>,
     status_sender: Sender<Status>,
     mode: ConfigJDCMode,
     task_manager: Arc<TaskManager>,
+    config: &JobDeclaratorClientConfig,
 ) -> Result<(Upstream, JobDeclarator), JDCError> {
     info!("Upstream connection in-progress at initialize single");
     let upstream = Upstream::new(
@@ -448,6 +454,7 @@ async fn try_initialize_single(
         notify_shutdown.clone(),
         task_manager.clone(),
         status_sender.clone(),
+        config.required_extensions().clone(),
     )
     .await?;
 

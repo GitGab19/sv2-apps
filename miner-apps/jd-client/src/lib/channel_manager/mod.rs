@@ -26,8 +26,9 @@ use stratum_apps::{
             Vardiff, VardiffState,
         },
         handlers_sv2::{
-            HandleJobDeclarationMessagesFromServerAsync, HandleMiningMessagesFromClientAsync,
-            HandleMiningMessagesFromServerAsync, HandleTemplateDistributionMessagesFromServerAsync,
+            HandleExtensionsFromServerAsync, HandleJobDeclarationMessagesFromServerAsync,
+            HandleMiningMessagesFromClientAsync, HandleMiningMessagesFromServerAsync,
+            HandleTemplateDistributionMessagesFromServerAsync,
         },
         job_declaration_sv2::{
             AllocateMiningJobToken, AllocateMiningJobTokenSuccess, DeclareMiningJob,
@@ -37,13 +38,16 @@ use stratum_apps::{
             UpdateChannel, MAX_EXTRANONCE_LEN,
         },
         noise_sv2::Responder,
-        parsers_sv2::{JobDeclaration, Mining, TemplateDistribution},
+        parsers_sv2::{AnyMessage, JobDeclaration, Mining, TemplateDistribution, Tlv},
         template_distribution_sv2::{NewTemplate, SetNewPrevHash as SetNewPrevHashTdp},
     },
     task_manager::TaskManager,
-    utils::types::{
-        ChannelId, DownstreamId, Message, RequestId, SharesBatchSize, SharesPerMinute, TemplateId,
-        UpstreamJobId, VardiffKey,
+    utils::{
+        protocol_message_type::{protocol_message_type, MessageType},
+        types::{
+            ChannelId, DownstreamId, Message, RequestId, SharesBatchSize, SharesPerMinute,
+            Sv2Frame, TemplateId, UpstreamJobId, VardiffKey,
+        },
     },
 };
 use tokio::{net::TcpListener, select, sync::broadcast};
@@ -61,6 +65,7 @@ use crate::{
     },
 };
 mod downstream_message_handler;
+mod extensions_message_handler;
 mod jd_message_handler;
 mod template_message_handler;
 mod upstream_message_handler;
@@ -141,6 +146,12 @@ pub struct ChannelManagerData {
     // Mapping of `(downstream_id, channel_id)` → vardiff controller.
     // Each entry manages variable difficulty for a specific downstream channel.
     vardiff: HashMap<VardiffKey, VardiffState>,
+    /// Extensions that have been successfully negotiated with the upstream server
+    negotiated_extensions: Vec<u16>,
+    /// Extensions that the JDC supports
+    supported_extensions: Vec<u16>,
+    /// Extensions that the JDC requires
+    required_extensions: Vec<u16>,
 }
 
 impl ChannelManagerData {
@@ -210,14 +221,14 @@ impl ChannelManagerData {
 
 #[derive(Clone)]
 pub struct ChannelManagerChannel {
-    upstream_sender: Sender<Mining<'static>>,
-    upstream_receiver: Receiver<Mining<'static>>,
+    upstream_sender: Sender<Sv2Frame>,
+    upstream_receiver: Receiver<Sv2Frame>,
     jd_sender: Sender<JobDeclaration<'static>>,
     jd_receiver: Receiver<JobDeclaration<'static>>,
     tp_sender: Sender<TemplateDistribution<'static>>,
     tp_receiver: Receiver<TemplateDistribution<'static>>,
-    downstream_sender: broadcast::Sender<(DownstreamId, Mining<'static>)>,
-    downstream_receiver: Receiver<(DownstreamId, Mining<'static>)>,
+    downstream_sender: broadcast::Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
+    downstream_receiver: Receiver<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
     status_sender: Sender<Status>,
 }
 
@@ -245,16 +256,18 @@ impl ChannelManager {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: JobDeclaratorClientConfig,
-        upstream_sender: Sender<Mining<'static>>,
-        upstream_receiver: Receiver<Mining<'static>>,
+        upstream_sender: Sender<Sv2Frame>,
+        upstream_receiver: Receiver<Sv2Frame>,
         jd_sender: Sender<JobDeclaration<'static>>,
         jd_receiver: Receiver<JobDeclaration<'static>>,
         tp_sender: Sender<TemplateDistribution<'static>>,
         tp_receiver: Receiver<TemplateDistribution<'static>>,
-        downstream_sender: broadcast::Sender<(DownstreamId, Mining<'static>)>,
-        downstream_receiver: Receiver<(DownstreamId, Mining<'static>)>,
+        downstream_sender: broadcast::Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
+        downstream_receiver: Receiver<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
         status_sender: Sender<Status>,
         coinbase_outputs: Vec<u8>,
+        supported_extensions: Vec<u16>,
+        required_extensions: Vec<u16>,
     ) -> Result<Self, JDCError> {
         let (range_0, range_1, range_2) = {
             let range_1 = 0..JDC_SEARCH_SPACE_BYTES;
@@ -293,6 +306,9 @@ impl ChannelManager {
             pending_downstream_requests: VecDeque::new(),
             job_factory: None,
             vardiff: HashMap::new(),
+            negotiated_extensions: vec![],
+            supported_extensions,
+            required_extensions,
         }));
 
         let channel_manager_channel = ChannelManagerChannel {
@@ -331,8 +347,14 @@ impl ChannelManager {
         task_manager: Arc<TaskManager>,
         notify_shutdown: broadcast::Sender<ShutdownMessage>,
         status_sender: Sender<Status>,
-        channel_manager_sender: Sender<(DownstreamId, Mining<'static>)>,
-        channel_manager_receiver: broadcast::Sender<(DownstreamId, Mining<'static>)>,
+        channel_manager_sender: Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
+        channel_manager_receiver: broadcast::Sender<(
+            DownstreamId,
+            Mining<'static>,
+            Option<Vec<Tlv>>,
+        )>,
+        supported_extensions: Vec<u16>,
+        required_extensions: Vec<u16>,
     ) -> Result<(), JDCError> {
         info!("Starting downstream server at {listening_address}");
         let server = TcpListener::bind(listening_address).await.map_err(|e| {
@@ -408,6 +430,8 @@ impl ChannelManager {
                                     notify_shutdown.clone(),
                                     task_manager_clone.clone(),
                                     status_sender.clone(),
+                                    supported_extensions.clone(),
+                                    required_extensions.clone(),
                                 );
 
                                 self.channel_manager_data.super_safe_lock(|data| {
@@ -504,7 +528,7 @@ impl ChannelManager {
                             break;
                         }
                     }
-                    res = cm_pool.handle_pool_message() => {
+                    res = cm_pool.handle_pool_message_frame() => {
                         if let Err(e) = res {
                             if !e.is_critical() {
                                 continue;
@@ -564,7 +588,7 @@ impl ChannelManager {
     /// - If the frame contains any unsupported message type, an error is returned.
     async fn handle_jds_message(&mut self) -> Result<(), JDCError> {
         if let Ok(message) = self.channel_manager_channel.jd_receiver.recv().await {
-            self.handle_job_declaration_message_from_server(None, message)
+            self.handle_job_declaration_message_from_server(None, message, None)
                 .await?;
         }
         Ok(())
@@ -576,10 +600,26 @@ impl ChannelManager {
     /// - If the frame contains a **Mining** message, it forwards it to the   mining message
     ///   handler.
     /// - If the frame contains any unsupported message type, an error is returned.
-    async fn handle_pool_message(&mut self) -> Result<(), JDCError> {
-        if let Ok(message) = self.channel_manager_channel.upstream_receiver.recv().await {
-            self.handle_mining_message_from_server(None, message)
-                .await?;
+    async fn handle_pool_message_frame(&mut self) -> Result<(), JDCError> {
+        if let Ok(mut sv2_frame) = self.channel_manager_channel.upstream_receiver.recv().await {
+            let header = sv2_frame.get_header().expect("header must be present");
+            let message_type = header.msg_type();
+            let extension_type = header.ext_type();
+            let payload = sv2_frame.payload();
+            match protocol_message_type(extension_type, message_type) {
+                MessageType::Mining => {
+                    self.handle_mining_message_frame_from_server(None, header, payload)
+                        .await?;
+                }
+                MessageType::Extensions => {
+                    self.handle_extensions_message_frame_from_server(None, header, payload)
+                        .await?;
+                }
+                _ => {
+                    warn!("Received unsupported message type from upstream: {message_type}");
+                    return Err(JDCError::UnexpectedMessage(extension_type, message_type));
+                }
+            }
         }
         Ok(())
     }
@@ -592,7 +632,7 @@ impl ChannelManager {
     // - If the frame contains any unsupported message type, an error is returned.
     async fn handle_template_provider_message(&mut self) -> Result<(), JDCError> {
         if let Ok(message) = self.channel_manager_channel.tp_receiver.recv().await {
-            self.handle_template_distribution_message_from_server(None, message)
+            self.handle_template_distribution_message_from_server(None, message, None)
                 .await?;
         }
         Ok(())
@@ -632,7 +672,7 @@ impl ChannelManager {
     // - After the upstream channel is established, all new downstream requests bypass the pending
     //   mechanism and are sent directly to the mining handler.
     async fn handle_downstream_message(&mut self) -> Result<(), JDCError> {
-        if let Ok((downstream_id, message)) = self
+        if let Ok((downstream_id, message, tlvs)) = self
             .channel_manager_channel
             .downstream_receiver
             .recv()
@@ -663,10 +703,11 @@ impl ChannelManager {
                                 let upstream_message =
                                     Mining::OpenExtendedMiningChannel(upstream_message)
                                         .into_static();
-
+                                let sv2_frame: Sv2Frame =
+                                    AnyMessage::Mining(upstream_message).try_into()?;
                                 self.channel_manager_channel
                                     .upstream_sender
-                                    .send(upstream_message)
+                                    .send(sv2_frame)
                                     .await
                                     .map_err(|_| JDCError::ChannelErrorSender)?;
                             }
@@ -681,6 +722,7 @@ impl ChannelManager {
                             self.send_open_channel_request_to_mining_handler(
                                 downstream_id,
                                 Mining::OpenExtendedMiningChannel(downstream_msg),
+                                tlvs.as_deref(),
                             )
                             .await?;
                         }
@@ -688,6 +730,7 @@ impl ChannelManager {
                             self.send_open_channel_request_to_mining_handler(
                                 downstream_id,
                                 Mining::OpenExtendedMiningChannel(downstream_msg),
+                                tlvs.as_deref(),
                             )
                             .await?;
                         }
@@ -718,9 +761,10 @@ impl ChannelManager {
 
                                 let message =
                                     Mining::OpenExtendedMiningChannel(upstream_open).into_static();
+                                let sv2_frame: Sv2Frame = AnyMessage::Mining(message).try_into()?;
                                 self.channel_manager_channel
                                     .upstream_sender
-                                    .send(message)
+                                    .send(sv2_frame)
                                     .await
                                     .map_err(|_| JDCError::ChannelErrorSender)?;
                             }
@@ -735,6 +779,7 @@ impl ChannelManager {
                             self.send_open_channel_request_to_mining_handler(
                                 downstream_id,
                                 Mining::OpenStandardMiningChannel(downstream_msg),
+                                tlvs.as_deref(),
                             )
                             .await?;
                         }
@@ -742,14 +787,19 @@ impl ChannelManager {
                             self.send_open_channel_request_to_mining_handler(
                                 downstream_id,
                                 Mining::OpenStandardMiningChannel(downstream_msg),
+                                tlvs.as_deref(),
                             )
                             .await?;
                         }
                     }
                 }
                 _ => {
-                    self.handle_mining_message_from_client(Some(downstream_id), message)
-                        .await?;
+                    self.handle_mining_message_from_client(
+                        Some(downstream_id),
+                        message,
+                        tlvs.as_deref(),
+                    )
+                    .await?;
                 }
             }
         }
@@ -763,8 +813,9 @@ impl ChannelManager {
         &mut self,
         downstream_id: DownstreamId,
         message: Mining<'_>,
+        tlvs: Option<&[Tlv]>,
     ) -> Result<(), JDCError> {
-        self.handle_mining_message_from_client(Some(downstream_id), message)
+        self.handle_mining_message_from_client(Some(downstream_id), message, tlvs)
             .await?;
         Ok(())
     }
@@ -1004,7 +1055,7 @@ impl ChannelManager {
             });
 
         for message in messages {
-            message.forward(&self.channel_manager_channel).await;
+            let _ = message.forward(&self.channel_manager_channel).await;
         }
 
         info!("Vardiff update cycle complete");

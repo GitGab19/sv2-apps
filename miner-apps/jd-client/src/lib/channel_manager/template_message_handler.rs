@@ -7,7 +7,7 @@ use stratum_apps::stratum_core::{
     handlers_sv2::HandleTemplateDistributionMessagesFromServerAsync,
     job_declaration_sv2::DeclareMiningJob,
     mining_sv2::SetNewPrevHash as SetNewPrevHashMp,
-    parsers_sv2::{JobDeclaration, Mining, TemplateDistribution},
+    parsers_sv2::{JobDeclaration, Mining, TemplateDistribution, Tlv},
     template_distribution_sv2::*,
 };
 use tracing::{error, info, warn};
@@ -20,6 +20,11 @@ use crate::{
 
 impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
     type Error = JDCError;
+
+    fn get_negotiated_extensions_with_server(&self, _server_id: Option<usize>) -> Vec<u16> {
+        self.channel_manager_data
+            .super_safe_lock(|data| data.negotiated_extensions.clone())
+    }
 
     // Handles a `NewTemplate` message from the Template Provider.
     //
@@ -37,6 +42,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         msg: NewTemplate<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
@@ -237,7 +243,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         }
 
         for message in messages {
-            message.forward(&self.channel_manager_channel).await;
+            let _ = message.forward(&self.channel_manager_channel).await;
         }
 
         Ok(())
@@ -248,6 +254,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         msg: RequestTransactionDataError<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", msg);
         let error_code = msg.error_code.as_utf8_or_hex();
@@ -273,6 +280,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         msg: RequestTransactionDataSuccess<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
@@ -400,6 +408,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         &mut self,
         _server_id: Option<usize>,
         msg: SetNewPrevHash<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
@@ -597,7 +606,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
         }
 
         for message in messages {
-            message.forward(&self.channel_manager_channel).await;
+            let _ = message.forward(&self.channel_manager_channel).await;
         }
 
         Ok(())

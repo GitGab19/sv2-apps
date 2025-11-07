@@ -1,26 +1,32 @@
 use std::sync::atomic::Ordering;
 
-use stratum_apps::stratum_core::{
-    binary_sv2::Str0255,
-    bitcoin::{Amount, Target},
-    channels_sv2::{
-        client,
-        outputs::deserialize_outputs,
-        server::{
-            error::{ExtendedChannelError, StandardChannelError},
-            extended::ExtendedChannel,
-            group::GroupChannel,
-            jobs::job_store::DefaultJobStore,
-            share_accounting::{ShareValidationError, ShareValidationResult},
-            standard::StandardChannel,
+use stratum_apps::{
+    stratum_core::{
+        binary_sv2::Str0255,
+        bitcoin::{Amount, Target},
+        channels_sv2::{
+            client,
+            outputs::deserialize_outputs,
+            server::{
+                error::{ExtendedChannelError, StandardChannelError},
+                extended::ExtendedChannel,
+                group::GroupChannel,
+                jobs::job_store::DefaultJobStore,
+                share_accounting::{ShareValidationError, ShareValidationResult},
+                standard::StandardChannel,
+            },
+            Vardiff, VardiffState,
         },
-        Vardiff, VardiffState,
+        extensions_sv2::{
+            UserIdentity, EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY,
+        },
+        handlers_sv2::{HandleMiningMessagesFromClientAsync, SupportedChannelTypes},
+        job_declaration_sv2::PushSolution,
+        mining_sv2::*,
+        parsers_sv2::{AnyMessage, JobDeclaration, Mining, TemplateDistribution, Tlv, TlvField},
+        template_distribution_sv2::SubmitSolution,
     },
-    handlers_sv2::{HandleMiningMessagesFromClientAsync, SupportedChannelTypes},
-    job_declaration_sv2::PushSolution,
-    mining_sv2::*,
-    parsers_sv2::{JobDeclaration, Mining, TemplateDistribution},
-    template_distribution_sv2::SubmitSolution,
+    utils::types::Sv2Frame,
 };
 use tracing::{debug, error, info, warn};
 
@@ -90,18 +96,25 @@ impl RouteMessageTo<'_> {
     /// - [`RouteMessageTo::JobDeclarator`] → Sends the job declaration message to the JDS.
     /// - [`RouteMessageTo::TemplateProvider`] → Sends the template distribution message to the
     ///   template provider.
-    pub async fn forward(self, channel_manager_channel: &ChannelManagerChannel) {
+    pub async fn forward(
+        self,
+        channel_manager_channel: &ChannelManagerChannel,
+    ) -> Result<(), JDCError> {
         match self {
             RouteMessageTo::Downstream((downstream_id, message)) => {
-                _ = channel_manager_channel
-                    .downstream_sender
-                    .send((downstream_id, message.into_static()));
+                _ = channel_manager_channel.downstream_sender.send((
+                    downstream_id,
+                    message.into_static(),
+                    None,
+                ));
             }
             RouteMessageTo::Upstream(message) => {
                 if get_jd_mode() != JdMode::SoloMining {
+                    let message_static = message.into_static();
+                    let sv2_frame: Sv2Frame = AnyMessage::Mining(message_static).try_into()?;
                     _ = channel_manager_channel
                         .upstream_sender
-                        .send(message.into_static())
+                        .send(sv2_frame)
                         .await;
                 }
             }
@@ -118,11 +131,27 @@ impl RouteMessageTo<'_> {
                     .await;
             }
         }
+        Ok(())
     }
 }
 
 impl HandleMiningMessagesFromClientAsync for ChannelManager {
     type Error = JDCError;
+
+    fn get_negotiated_extensions_with_client(&self, client_id: Option<usize>) -> Vec<u16> {
+        let downstream_id =
+            client_id.expect("client_id must be present for downstream_id extraction");
+        self.channel_manager_data.super_safe_lock(|data| {
+            data.downstream
+                .get(&downstream_id)
+                .map(|downstream| {
+                    downstream
+                        .downstream_data
+                        .super_safe_lock(|data| data.negotiated_extensions.clone())
+                })
+                .expect("negotiated_extensions must be present")
+        })
+    }
 
     fn get_channel_type_for_client(&self, _client_id: Option<usize>) -> SupportedChannelTypes {
         SupportedChannelTypes::GroupAndExtended
@@ -146,6 +175,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: CloseChannel<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
         let downstream_id =
@@ -192,6 +222,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: OpenStandardMiningChannel<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         let request_id = msg.get_request_id_as_u32();
         let user_identity = msg.user_identity.as_utf8_or_hex();
@@ -455,7 +486,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 })?;
 
         for messages in messages {
-            messages.forward(&self.channel_manager_channel).await;
+            let _ = messages.forward(&self.channel_manager_channel).await;
         }
         Ok(())
     }
@@ -480,6 +511,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: OpenExtendedMiningChannel<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         let user_identity = msg.user_identity.as_utf8_or_hex();
         let downstream_id =
@@ -663,7 +695,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 })?;
 
         for messages in messages {
-            messages.forward(&self.channel_manager_channel).await;
+            let _ = messages.forward(&self.channel_manager_channel).await;
         }
 
         Ok(())
@@ -687,6 +719,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: UpdateChannel<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
         let channel_id = msg.channel_id;
@@ -853,7 +886,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             });
 
         for messages in messages {
-            messages.forward(&self.channel_manager_channel).await;
+            let _ = messages.forward(&self.channel_manager_channel).await;
         }
 
         Ok(())
@@ -874,6 +907,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: SubmitSharesStandard,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received SubmitSharesStandard");
         let channel_id = msg.channel_id;
@@ -1047,7 +1081,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         })?;
 
         for messages in messages {
-            messages.forward(&self.channel_manager_channel).await;
+            let _ = messages.forward(&self.channel_manager_channel).await;
         }
 
         Ok(())
@@ -1068,12 +1102,14 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         client_id: Option<usize>,
         msg: SubmitSharesExtended<'_>,
+        tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received SubmitSharesExtended");
         let channel_id = msg.channel_id;
         let job_id = msg.job_id;
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
+        let negotiated_extensions = self.get_negotiated_extensions_with_client(client_id);
 
         let build_error = |code: &str| {
             Mining::SubmitSharesError(SubmitSharesError {
@@ -1099,6 +1135,22 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     error!("SubmitSharesError: channel_id: {channel_id}, sequence_number: {}, error_code: invalid-channel-id", msg.sequence_number);
                     return Ok(vec![(downstream_id, build_error("invalid-channel-id")).into()]);
                 };
+                // here we extract and set the user_identity from the TLV fields if the extension is negotiated
+                let user_identity = if negotiated_extensions.contains(&EXTENSION_TYPE_WORKER_HASHRATE_TRACKING) {
+                    tlv_fields.and_then(|tlvs| {
+                        tlvs.iter()
+                            .find(|tlv| {
+                                tlv.type_.extension_type == EXTENSION_TYPE_WORKER_HASHRATE_TRACKING
+                                    && tlv.type_.field_type == TLV_FIELD_TYPE_USER_IDENTITY
+                            })
+                            .and_then(|tlv| UserIdentity::from_tlv(tlv).ok())
+                    })
+                } else {
+                    None
+                };
+                if let Some(user_identity) = user_identity {
+                    extended_channel.set_user_identity(user_identity.as_string_or_hex());
+                }
 
                 let Some(vardiff) = channel_manager_data.vardiff.get_mut(&(downstream_id, channel_id).into()) else {
                     return Err(JDCError::VardiffNotFound((downstream_id, channel_id).into()));
@@ -1220,7 +1272,10 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     prev_hash: prev_hash.prev_hash.clone(),
                                 };
                                 messages.push(JobDeclaration::PushSolution(push_solution.clone()).into());
-                                messages.push(Mining::SubmitSharesExtended(upstream_message.into_static()).into());
+                                // TODO here we should add the user_identity TLV to the SubmitSharesExtended frame
+                                messages.push(
+                                    Mining::SubmitSharesExtended(upstream_message.into_static()).into(),
+                                );
                             }
                             Err(err) => {
                                 let code = match err {
@@ -1242,7 +1297,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         })?;
 
         for messages in messages {
-            messages.forward(&self.channel_manager_channel).await;
+            messages.forward(&self.channel_manager_channel).await?;
         }
 
         Ok(())
@@ -1253,9 +1308,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         &mut self,
         _client_id: Option<usize>,
         msg: SetCustomMiningJob<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", msg);
         Err(Self::Error::UnexpectedMessage(
+            0,
             MESSAGE_TYPE_SET_CUSTOM_MINING_JOB,
         ))
     }

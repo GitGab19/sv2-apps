@@ -7,7 +7,7 @@ use stratum_apps::{
             SetupConnectionError, SetupConnectionSuccess,
         },
         handlers_sv2::HandleCommonMessagesFromClientAsync,
-        parsers_sv2::AnyMessage,
+        parsers_sv2::{AnyMessage, Tlv},
     },
     utils::types::Sv2Frame,
 };
@@ -15,6 +15,11 @@ use tracing::info;
 
 impl HandleCommonMessagesFromClientAsync for Downstream {
     type Error = JDCError;
+
+    fn get_negotiated_extensions_with_client(&self, _client_id: Option<usize>) -> Vec<u16> {
+        self.downstream_data
+            .super_safe_lock(|data| data.negotiated_extensions.clone())
+    }
     // Handles the initial [`SetupConnection`] message from a downstream client.
     //
     // This method validates that the connection request is compatible with the
@@ -40,6 +45,7 @@ impl HandleCommonMessagesFromClientAsync for Downstream {
         &mut self,
         _client_id: Option<usize>,
         msg: SetupConnection<'_>,
+        _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 

@@ -23,7 +23,6 @@ use stratum_apps::{
             Transaction, TxIn, TxOut, Witness,
         },
         codec_sv2::HandshakeRole,
-        framing_sv2,
         handlers_sv2::HandleCommonMessagesFromServerAsync,
         noise_sv2::Initiator,
         parsers_sv2::{AnyMessage, TemplateDistribution},
@@ -272,22 +271,19 @@ impl TemplateReceiver {
         let mut sv2_frame = self.template_receiver_channel.tp_receiver.recv().await?;
 
         debug!("Received SV2 frame from Template provider.");
-        let Some(message_type) = sv2_frame.get_header().map(|m| m.msg_type()) else {
-            return Ok(());
-        };
+        let header = sv2_frame.get_header().expect("header must be present");
+        let message_type = header.msg_type();
+        let extension_type = header.ext_type();
 
-        match protocol_message_type(message_type) {
+        match protocol_message_type(extension_type, message_type) {
             MessageType::Common => {
                 info!(
-                    ?message_type,
+                    ext_type = ?extension_type,
+                    msg_type = ?message_type,
                     "Handling common message from Template provider."
                 );
-                self.handle_common_message_frame_from_server(
-                    None,
-                    message_type,
-                    sv2_frame.payload(),
-                )
-                .await?;
+                self.handle_common_message_frame_from_server(None, header, sv2_frame.payload())
+                    .await?;
             }
             MessageType::TemplateDistribution => {
                 let message = TemplateDistribution::try_from((message_type, sv2_frame.payload()))?
@@ -419,13 +415,12 @@ impl TemplateReceiver {
                 )
             })?;
 
-        let msg_type = incoming
-            .get_header()
-            .ok_or(framing_sv2::Error::ExpectedHandshakeFrame)?
-            .msg_type();
-        debug!(?msg_type, "Received upstream handshake response");
+        let header = incoming.get_header().expect("header must be present");
+        debug!(ext_type = ?header.ext_type(),
+            msg_type = ?header.msg_type(),
+            "Received upstream handshake response");
 
-        self.handle_common_message_frame_from_server(None, msg_type, incoming.payload())
+        self.handle_common_message_frame_from_server(None, header, incoming.payload())
             .await?;
         info!("Handshake with upstream completed successfully");
         Ok(())
