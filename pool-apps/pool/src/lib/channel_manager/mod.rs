@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{
+        atomic::{AtomicU32, AtomicUsize},
+        Arc,
+    },
 };
 
 use async_channel::{Receiver, Sender};
@@ -13,10 +16,11 @@ use stratum_apps::{
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     network_helpers::noise_stream::NoiseTcpStream,
     stratum_core::{
-        bitcoin::TxOut,
+        bitcoin::{Amount, TxOut},
         channels_sv2::{
             server::{
                 extended::ExtendedChannel,
+                group::GroupChannel,
                 jobs::{extended::ExtendedJob, job_store::DefaultJobStore, standard::StandardJob},
                 standard::StandardChannel,
             },
@@ -166,6 +170,56 @@ impl ChannelManager {
         Ok(channel_manager)
     }
 
+    // Bootstraps a group channel with the given parameters.
+    // Returns a `GroupChannel` if successful, otherwise returns `None`.
+    //
+    // To be called before calling Downstream::new.
+    fn bootstrap_group_channel(
+        &self,
+        channel_id: ChannelId,
+    ) -> Option<GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>> {
+        let (last_future_template, last_set_new_prev_hash) =
+            self.channel_manager_data.super_safe_lock(|data| {
+                (
+                    data.last_future_template
+                        .clone()
+                        .expect("No future template found after readiness check"),
+                    data.last_new_prev_hash
+                        .clone()
+                        .expect("No new prevhash found after readiness check"),
+                )
+            });
+        let mut group_channel = match GroupChannel::new_for_pool(
+            channel_id,
+            DefaultJobStore::new(),
+            FULL_EXTRANONCE_SIZE,
+            self.pool_tag_string.clone(),
+        ) {
+            Ok(channel) => channel,
+            Err(e) => {
+                error!(error = ?e, "Failed to bootstrap group channel");
+                return None;
+            }
+        };
+
+        let coinbase_output = TxOut {
+            value: Amount::from_sat(last_future_template.coinbase_tx_value_remaining),
+            script_pubkey: self.coinbase_reward_script.script_pubkey(),
+        };
+
+        if let Err(e) = group_channel.on_new_template(last_future_template, vec![coinbase_output]) {
+            error!(error = ?e, "Failed to add template to group channel");
+            return None;
+        }
+
+        if let Err(e) = group_channel.on_set_new_prev_hash(last_set_new_prev_hash) {
+            error!(error = ?e, "Failed to set new prevhash for group channel");
+            return None;
+        }
+
+        Some(group_channel)
+    }
+
     /// Starts the downstream server, and accepts new connection request.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_downstream_server(
@@ -184,6 +238,38 @@ impl ChannelManager {
             Option<Vec<Tlv>>,
         )>,
     ) -> PoolResult<(), error::ChannelManager> {
+        let mut shutdown_rx = notify_shutdown.subscribe();
+
+        // Wait for initial template and prevhash before accepting connections
+        loop {
+            let has_required_data = self.channel_manager_data.super_safe_lock(|data| {
+                data.last_future_template.is_some() && data.last_new_prev_hash.is_some()
+            });
+
+            if has_required_data {
+                info!("Required template data received, ready to accept connections");
+                break;
+            }
+
+            warn!("Waiting for initial template and prevhash from Template Provider...");
+            select! {
+                message = shutdown_rx.recv() => {
+                    match message {
+                        Ok(ShutdownMessage::ShutdownAll) => {
+                            info!("Channel Manager: received shutdown while waiting for templates");
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!(error = ?e, "shutdown channel closed unexpectedly");
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+        }
+
         info!("Starting downstream server at {listening_address}");
         let server = TcpListener::bind(listening_address)
             .await
@@ -192,8 +278,6 @@ impl ChannelManager {
                 e
             })
             .map_err(PoolError::shutdown)?;
-
-        let mut shutdown_rx = notify_shutdown.subscribe();
 
         let task_manager_clone = task_manager.clone();
         task_manager.spawn(async move {
@@ -245,9 +329,22 @@ impl ChannelManager {
                                     .channel_manager_data
                                     .super_safe_lock(|data| data.downstream_id_factory.fetch_add(1, Ordering::SeqCst));
 
+                                let channel_id_factory = AtomicU32::new(1);
+                                let group_channel_id = channel_id_factory.fetch_add(1, Ordering::SeqCst);
+                                let group_channel = match self.bootstrap_group_channel(group_channel_id) {
+                                    Some(group_channel) => group_channel,
+                                    None => {
+                                        error!("Failed to bootstrap group channel");
+                                        let error = PoolError::<error::ChannelManager>::shutdown(PoolErrorKind::CouldNotInitiateSystem);
+                                        handle_error(&StatusSender::ChannelManager(status_sender.clone()), error).await;
+                                        break;
+                                    }
+                                };
 
                                 let downstream = Downstream::new(
                                     downstream_id,
+                                    channel_id_factory,
+                                    group_channel,
                                     channel_manager_sender.clone(),
                                     channel_manager_receiver.clone(),
                                     noise_stream,
@@ -257,7 +354,6 @@ impl ChannelManager {
                                     self.supported_extensions.clone(),
                                     self.required_extensions.clone(),
                                 );
-
 
                                 self.channel_manager_data.super_safe_lock(|data| {
                                     data.downstream.insert(downstream_id, downstream.clone());

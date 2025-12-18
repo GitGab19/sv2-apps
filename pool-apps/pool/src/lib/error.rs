@@ -163,8 +163,6 @@ pub enum PoolErrorKind {
     VardiffNotFound(ChannelId),
     /// Errors on bad `String` to `int` conversion.
     ParseInt(std::num::ParseIntError),
-    /// Failed to create group channel
-    FailedToCreateGroupChannel(GroupChannelError),
     /// Invalid unsupported extensions sequence
     InvalidUnsupportedExtensionsSequence(binary_sv2::Error),
     /// Invalid required extensions sequence
@@ -187,6 +185,8 @@ pub enum PoolErrorKind {
     CouldNotInitiateSystem,
     /// Configuration error
     Configuration(String),
+    /// Job not found
+    JobNotFound,
 }
 
 impl std::fmt::Display for PoolErrorKind {
@@ -233,9 +233,6 @@ impl std::fmt::Display for PoolErrorKind {
             ChannelSv2(channel_error) => {
                 write!(f, "Channel error: {channel_error:?}")
             }
-            FailedToCreateGroupChannel(ref e) => {
-                write!(f, "Failed to create group channel: {e:?}")
-            }
             InvalidUnsupportedExtensionsSequence(e) => {
                 write!(
                     f,
@@ -277,6 +274,7 @@ impl std::fmt::Display for PoolErrorKind {
             }
             CouldNotInitiateSystem => write!(f, "Could not initiate subsystem"),
             Configuration(e) => write!(f, "Configuration error: {e}"),
+            JobNotFound => write!(f, "Job not found"),
         }
     }
 }
