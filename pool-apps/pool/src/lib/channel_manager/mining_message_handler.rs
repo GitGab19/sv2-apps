@@ -7,7 +7,6 @@ use stratum_apps::stratum_core::{
         server::{
             error::{ExtendedChannelError, StandardChannelError},
             extended::ExtendedChannel,
-            group::GroupChannel,
             jobs::job_store::DefaultJobStore,
             share_accounting::{ShareValidationError, ShareValidationResult},
             standard::StandardChannel,
@@ -25,7 +24,7 @@ use stratum_apps::stratum_core::{
 use tracing::{error, info};
 
 use crate::{
-    channel_manager::{ChannelManager, RouteMessageTo, FULL_EXTRANONCE_SIZE},
+    channel_manager::{ChannelManager, RouteMessageTo, CLIENT_SEARCH_SPACE_BYTES},
     error::{self, PoolError, PoolErrorKind},
     utils::create_close_channel_msg,
 };
@@ -149,22 +148,6 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             };
 
             downstream.downstream_data.super_safe_lock(|downstream_data| {
-                if !downstream.requires_standard_jobs.load(Ordering::SeqCst) && downstream_data.group_channels.is_none() {
-                    let group_channel_id = downstream_data.channel_id_factory.fetch_add(1, Ordering::SeqCst);
-                    let job_store = DefaultJobStore::new();
-
-                    let mut group_channel = match GroupChannel::new_for_pool(group_channel_id, job_store, FULL_EXTRANONCE_SIZE, self.pool_tag_string.clone()) {
-                        Ok(channel) => channel,
-                        Err(e) => {
-                            error!(?e, "Failed to create group channel");
-                            return Err(PoolError::shutdown(e));
-                        }
-                    };
-                    group_channel.on_new_template(last_future_template.clone(), vec![pool_coinbase_output.clone()]).map_err(PoolError::shutdown)?;
-
-                    group_channel.on_set_new_prev_hash(last_set_new_prev_hash_tdp.clone()).map_err(PoolError::shutdown)?;
-                    downstream_data.group_channels = Some(group_channel);
-                }
                 let nominal_hash_rate = msg.nominal_hash_rate;
                 let requested_max_target = Target::from_le_bytes(msg.max_target.inner_as_ref().try_into().unwrap());
                 let extranonce_prefix = channel_manager_data.extranonce_prefix_factory_standard.next_prefix_standard().map_err(PoolError::shutdown)?;
@@ -204,7 +187,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     },
                 };
 
-                let group_channel_id = downstream_data.group_channels.as_ref().map(|channel| channel.get_group_channel_id()).unwrap_or(0);
+                let group_channel_id = downstream_data.group_channel.get_group_channel_id();
+                let extranonce_prefix_size = standard_channel.get_extranonce_prefix().len();
 
                 let open_standard_mining_channel_success = OpenStandardMiningChannelSuccess {
                     request_id: msg.request_id,
@@ -249,8 +233,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 messages.push((downstream_id, Mining::SetNewPrevHash(set_new_prev_hash_mining)).into());
 
                 downstream_data.standard_channels.insert(channel_id, standard_channel);
-                if let Some(group_channel) = downstream_data.group_channels.as_mut() {
-                    group_channel.add_standard_channel_id(channel_id);
+                if !downstream.requires_standard_jobs.load(Ordering::SeqCst) {
+                    downstream_data.group_channel.add_channel_id(channel_id, extranonce_prefix_size).map_err(|e| {
+                        error!("Failed to add channel id to group channel: {:?}", e);
+                        PoolError::shutdown(e)
+                    })?;
                 }
                 let vardiff = VardiffState::new().map_err(PoolError::shutdown)?;
                 channel_manager_data.vardiff.insert((downstream_id, channel_id).into(), vardiff);
@@ -327,11 +314,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         let mut extended_channel = match ExtendedChannel::new_for_pool(
                             channel_id,
                             user_identity.to_string(),
-                            extranonce_prefix,
+                            extranonce_prefix.clone(),
                             requested_max_target,
                             nominal_hash_rate,
                             true, // version rolling always allowed
-                            requested_min_rollable_extranonce_size,
+                            CLIENT_SEARCH_SPACE_BYTES as u16,
                             self.share_batch_size,
                             self.shares_per_minute,
                             job_store,
@@ -400,6 +387,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             },
                         };
 
+                        let group_channel_id = downstream_data.group_channel.get_group_channel_id();
+
                         let open_extended_mining_channel_success =
                             OpenExtendedMiningChannelSuccess {
                                 request_id,
@@ -410,6 +399,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     .clone()
                                     .try_into().map_err(PoolError::shutdown)?,
                                 extranonce_size: extended_channel.get_rollable_extranonce_size(),
+                                group_channel_id,
                             }
                             .into_static();
                         info!("Sending OpenExtendedMiningChannel.Success (downstream_id: {downstream_id}): {open_extended_mining_channel_success}");
@@ -499,6 +489,12 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 )
                                     .into(),
                             );
+
+                            let full_extranonce_size = extended_channel.get_full_extranonce_size();
+                            downstream_data.group_channel.add_channel_id(channel_id, full_extranonce_size).map_err(|e| {
+                                error!("Failed to add channel id to group channel: {:?}", e);
+                                PoolError::shutdown(e)
+                            })?;
                         }
 
                         downstream_data
