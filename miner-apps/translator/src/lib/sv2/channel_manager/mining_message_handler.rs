@@ -3,13 +3,13 @@ use std::sync::{Arc, RwLock};
 use crate::{
     error::{self, TproxyError, TproxyErrorKind},
     sv2::{channel_manager::ChannelMode, ChannelManager},
-    utils::proxy_extranonce_prefix_len,
+    utils::{proxy_extranonce_prefix_len, AGGREGATED_CHANNEL_ID},
 };
 use stratum_apps::{
     custom_mutex::Mutex,
     stratum_core::{
         bitcoin::Target,
-        channels_sv2::client::extended::ExtendedChannel,
+        channels_sv2::client::{extended::ExtendedChannel, group::GroupChannel},
         handlers_sv2::{HandleMiningMessagesFromServerAsync, SupportedChannelTypes},
         mining_sv2::{
             CloseChannel, ExtendedExtranonce, Extranonce, NewExtendedMiningJob, NewMiningJob,
@@ -19,7 +19,6 @@ use stratum_apps::{
             SubmitSharesSuccess, UpdateChannelError,
             MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
             MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR, MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_SUCCESS,
-            MESSAGE_TYPE_SET_GROUP_CHANNEL,
         },
         parsers_sv2::{Mining, Tlv},
     },
@@ -32,7 +31,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
     type Error = TproxyError<error::ChannelManager>;
 
     fn get_channel_type_for_server(&self, _server_id: Option<usize>) -> SupportedChannelTypes {
-        SupportedChannelTypes::Extended
+        SupportedChannelTypes::GroupAndExtended
     }
 
     fn is_work_selection_enabled_for_server(&self, _server_id: Option<usize>) -> bool {
@@ -86,11 +85,36 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
 
         let success = self
             .channel_manager_data
-            .safe_lock(|channel_manager_data| {
+            .super_safe_lock(|channel_manager_data| {
                 info!(
                     "Received: {}, user_identity: {}, nominal_hashrate: {}",
                     m, user_identity, nominal_hashrate
                 );
+
+                let full_extranonce_size = m.extranonce_size as usize + m.extranonce_prefix.len();
+
+                // add the channel to the group channel
+                match channel_manager_data.group_channels.get(&m.group_channel_id) {
+                    Some(group_channel_arc) => {
+                        let mut group_channel = group_channel_arc.write().map_err(|e| {
+                            error!("Failed to write group channel: {:?}", e);
+                            TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                        })?;
+                        group_channel.add_channel_id(m.channel_id, full_extranonce_size).map_err(|e| {
+                            error!("Failed to add channel id to group channel: {:?}", e);
+                            TproxyError::fallback(TproxyErrorKind::FailedToAddChannelIdToGroupChannel(e))
+                        })?;
+                    }
+                    None => {
+                        let mut group_channel = GroupChannel::new(m.group_channel_id);
+                        group_channel.add_channel_id(m.channel_id, full_extranonce_size).map_err(|e| {
+                            error!("Failed to add channel id to group channel: {:?}", e);
+                            TproxyError::fallback(TproxyErrorKind::FailedToAddChannelIdToGroupChannel(e))
+                        })?;
+                        channel_manager_data.group_channels.insert(m.group_channel_id, Arc::new(RwLock::new(group_channel)));
+                    }
+                }
+
                 let extranonce_prefix = m.extranonce_prefix.clone().into_static().to_vec();
                 let target = Target::from_le_bytes(m.target.clone().inner_as_ref().try_into().unwrap());
                 let version_rolling = true; // we assume this is always true on extended channels
@@ -167,8 +191,9 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                             extranonce_prefix: new_extranonce_prefix,
                             extranonce_size: new_extranonce_size,
                             target: m.target.clone(),
+                            group_channel_id: m.group_channel_id,
                         };
-                    new_open_extended_mining_channel_success.into_static()
+                    Ok::<OpenExtendedMiningChannelSuccess<'static>, Self::Error>(new_open_extended_mining_channel_success.into_static())
                 } else {
                     // Non-aggregated mode: check if we need to adjust extranonce size
                     if m.extranonce_size as usize != downstream_extranonce_len {
@@ -228,14 +253,15 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                             extranonce_prefix: new_extranonce_prefix,
                             extranonce_size: downstream_extranonce_len as u16,
                             target: m.target.clone(),
+                            group_channel_id: m.group_channel_id,
                         };
-                        new_open_extended_mining_channel_success.into_static()
+                        Ok::<OpenExtendedMiningChannelSuccess<'static>, Self::Error>(new_open_extended_mining_channel_success.into_static())
                     } else {
                         // Extranonce size matches, use as-is
                         channel_manager_data
                             .extended_channels
                             .insert(m.channel_id, Arc::new(RwLock::new(extended_channel)));
-                        m.into_static()
+                        Ok::<OpenExtendedMiningChannelSuccess<'static>, Self::Error>(m.into_static())
                     }
                 }
             })
@@ -288,15 +314,60 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", m);
-        _ = self.channel_manager_data.safe_lock(|channel_data_manager| {
-            if channel_data_manager.mode == ChannelMode::Aggregated {
-                if channel_data_manager.upstream_extended_channel.is_some() {
-                    channel_data_manager.upstream_extended_channel = None;
+        self.channel_manager_data
+            .super_safe_lock(|channel_data_manager| {
+                // are we working in aggregated mode?
+                if channel_data_manager.mode == ChannelMode::Aggregated {
+                    // even if aggregated channel_id != m.channel_id, we should trigger fallback
+                    // because why would a sane server send a CloseChannel message to a different
+                    // channel?
+                    return Err(TproxyError::fallback(
+                        TproxyErrorKind::AggregatedChannelClosed,
+                    ));
+                // we're not in aggregated mode
+                // was the message sent to a group channel?
+                } else if let Some(group_channel_arc) =
+                    channel_data_manager.group_channels.get(&m.channel_id)
+                {
+                    let group_channel = group_channel_arc.read().map_err(|e| {
+                        error!("Failed to read group channel: {:?}", e);
+                        TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                    })?;
+
+                    for channel_id in group_channel.get_channel_ids() {
+                        channel_data_manager.extended_channels.remove(channel_id);
+                    }
+
+                    drop(group_channel);
+                    channel_data_manager.group_channels.remove(&m.channel_id);
+                // if the message was not sent to a group channel, and we're not working in
+                // aggregated mode,
+                } else if channel_data_manager
+                    .extended_channels
+                    .contains_key(&m.channel_id)
+                {
+                    // remove the channel from the extended channels map
+                    channel_data_manager.extended_channels.remove(&m.channel_id);
+
+                    // remove the channel from any group channels that contain it
+                    for group_channel in channel_data_manager.group_channels.values() {
+                        let mut group_channel = group_channel.write().map_err(|e| {
+                            error!("Failed to write group channel: {:?}", e);
+                            TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                        })?;
+                        if group_channel.get_channel_ids().contains(&m.channel_id) {
+                            group_channel.remove_channel_id(m.channel_id);
+                        }
+                    }
+                } else {
+                    error!(
+                        "Channel Id not found: {}, ignoring CloseChannel message",
+                        m.channel_id
+                    );
+                    return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                 }
-            } else {
-                channel_data_manager.extended_channels.remove(&m.channel_id);
-            }
-        });
+                Ok::<(), Self::Error>(())
+            })?;
         Ok(())
     }
 
@@ -349,40 +420,178 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", m);
-        let mut m_static = m.clone().into_static();
-        _ = self.channel_manager_data.safe_lock(|channel_manage_data| {
-            if channel_manage_data.mode == ChannelMode::Aggregated {
-                if let Some(upstream_channel) = &channel_manage_data.upstream_extended_channel {
-                    if let Ok(mut upstream_extended_channel) = upstream_channel.write() {
-                        let _ =
-                            upstream_extended_channel.on_new_extended_mining_job(m_static.clone());
-                        m_static.channel_id = 0; // this is done so that every aggregated downstream
-                                                 // will
-                                                 // receive the NewExtendedMiningJob message
+        let m_static = m.clone().into_static();
+
+        // we update the channel states and keep track of the messages that need to be sent to the
+        // SV1Server
+        let new_extended_mining_job_messages_sv1_server = self
+            .channel_manager_data
+            .super_safe_lock(|channel_manager_data| {
+                let mut new_extended_mining_job_messages = Vec::new();
+
+                // are we in aggregated mode?
+                if channel_manager_data.mode == ChannelMode::Aggregated {
+                    let mut aggregated_channel = channel_manager_data
+                        .upstream_extended_channel
+                        .as_ref()
+                        .ok_or(TproxyError::fallback(TproxyErrorKind::ChannelNotFound))?
+                        .write()
+                        .map_err(|e| {
+                            error!("Failed to write upstream channel: {:?}", e);
+                            TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                        })?;
+
+                    // here, we are assuming that since we are in aggregated mode, there should be
+                    // only one single group channel and the aggregated channel
+                    // must belong to it
+                    let group_channel = channel_manager_data.group_channels.values().next();
+                    let Some(group_channel) = group_channel else {
+                        error!("Aggregated channel does not belong to any group channel");
+                        return Err(TproxyError::fallback(TproxyErrorKind::ChannelNotFound));
+                    };
+
+                    let group_channel_guard = group_channel.read().map_err(|e| {
+                        error!("Failed to read group channel: {:?}", e);
+                        TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                    })?;
+
+                    let group_channel_id = group_channel_guard.get_group_channel_id();
+
+                    // was the message sent to the aggregated channel?
+                    if aggregated_channel.get_channel_id() == m_static.channel_id
+                        || group_channel_id == m_static.channel_id
+                    {
+                        // update upstream channel state
+                        aggregated_channel
+                            .on_new_extended_mining_job(m_static.clone())
+                            .map_err(|e| {
+                                error!("Failed to process new extended mining job: {:?}", e);
+                                TproxyError::fallback(
+                                    TproxyErrorKind::FailedToProcessNewExtendedMiningJob,
+                                )
+                            })?;
+
+                        // update each extended channel state
+                        for (_, channel) in channel_manager_data.extended_channels.iter() {
+                            let mut channel = channel.write().map_err(|e| {
+                                error!("Failed to write channel: {:?}", e);
+                                TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                            })?;
+                            channel
+                                .on_new_extended_mining_job(m_static.clone())
+                                .map_err(|e| {
+                                    error!("Failed to process new extended mining job: {:?}", e);
+                                    TproxyError::fallback(
+                                        TproxyErrorKind::FailedToProcessNewExtendedMiningJob,
+                                    )
+                                })?;
+                        }
+
+                        // only send this message to the SV1Server if it's not a future job
+                        if !m_static.is_future() {
+                            let mut new_extended_mining_job_message = m_static.clone();
+                            new_extended_mining_job_message.channel_id = AGGREGATED_CHANNEL_ID; // this is done so that every aggregated downstream
+                                                                                                // will receive the NewExtendedMiningJob message
+                            new_extended_mining_job_messages.push(new_extended_mining_job_message);
+                        }
+                    } else {
+                        // we got a nonsense channel id, we should log an error and ignore the
+                        // message
+                        error!(
+                            "Channel not found: {}, ignoring NewExtendedMiningJob message",
+                            m_static.channel_id
+                        );
+                        return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
+                    }
+                // we're not in aggregated mode
+                // was the message sent to a group channel?
+                } else if let Some(group_channel_arc) =
+                    channel_manager_data.group_channels.get(&m.channel_id)
+                {
+                    let mut group_channel = group_channel_arc.write().map_err(|e| {
+                        error!("Failed to read group channel: {:?}", e);
+                        TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                    })?;
+
+                    // update group channel state
+                    group_channel.on_new_extended_mining_job(m_static.clone());
+
+                    // process the message for each individual channel on the group
+                    for channel_id in group_channel.get_channel_ids() {
+                        let channel = channel_manager_data
+                            .extended_channels
+                            .get(channel_id)
+                            .ok_or(TproxyError::fallback(TproxyErrorKind::ChannelNotFound))?;
+                        let mut channel = channel.write().map_err(|e| {
+                            error!("Failed to write channel: {:?}", e);
+                            TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                        })?;
+
+                        let mut job = m_static.clone();
+                        job.channel_id = *channel_id;
+
+                        // update each channel state
+                        channel
+                            .on_new_extended_mining_job(job.clone())
+                            .map_err(|e| {
+                                error!("Failed to process new extended mining job: {:?}", e);
+                                TproxyError::fallback(
+                                    TproxyErrorKind::FailedToProcessNewExtendedMiningJob,
+                                )
+                            })?;
+
+                        // only send this message to the SV1Server if it's not a future job
+                        if !job.is_future() {
+                            new_extended_mining_job_messages.push(job);
+                        }
+                    }
+                // if the message was not sent to a group channel, we need to check if we're
+                // working in aggregated mode
+                } else {
+                    let Some(channel) = channel_manager_data
+                        .extended_channels
+                        .get(&m_static.channel_id)
+                    else {
+                        // we got a nonsense channel id, we should log an error and ignore the
+                        // message
+                        error!(
+                            "Channel not found: {}, ignoring NewExtendedMiningJob message",
+                            m_static.channel_id
+                        );
+                        return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
+                    };
+
+                    let mut channel = channel.write().map_err(|e| {
+                        error!("Failed to write to channel: {:?}", e);
+                        TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                    })?;
+
+                    // update channel state
+                    channel
+                        .on_new_extended_mining_job(m_static.clone())
+                        .map_err(|e| {
+                            error!("Failed to process new extended mining job: {:?}", e);
+                            TproxyError::fallback(
+                                TproxyErrorKind::FailedToProcessNewExtendedMiningJob,
+                            )
+                        })?;
+
+                    // only send this message to the SV1Server if it's not a future job
+                    if !m_static.is_future() {
+                        let new_extended_mining_job_message = m_static.clone();
+                        new_extended_mining_job_messages.push(new_extended_mining_job_message);
                     }
                 }
-                channel_manage_data
-                    .extended_channels
-                    .iter()
-                    .for_each(|(_, channel)| {
-                        if let Ok(mut channel) = channel.write() {
-                            let _ = channel.on_new_extended_mining_job(m_static.clone());
-                        }
-                    });
-            } else if let Some(channel) = channel_manage_data
-                .extended_channels
-                .get(&m_static.channel_id)
-            {
-                if let Ok(mut channel) = channel.write() {
-                    let _ = channel.on_new_extended_mining_job(m_static.clone());
-                }
-            }
-        });
-        let job = m_static;
-        if !job.is_future() {
+                Ok::<Vec<NewExtendedMiningJob<'static>>, Self::Error>(
+                    new_extended_mining_job_messages,
+                )
+            })?;
+
+        // now we need to send the NewExtendedMiningJob message(s) to the SV1Server
+        for message in new_extended_mining_job_messages_sv1_server {
             self.channel_state
                 .sv1_server_sender
-                .send((Mining::NewExtendedMiningJob(job), None))
+                .send((Mining::NewExtendedMiningJob(message), None))
                 .await
                 .map_err(|e| {
                     error!("Failed to send immediate NewExtendedMiningJob: {:?}", e);
@@ -400,73 +609,196 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {}", m);
         let m_static = m.clone().into_static();
-        _ = self.channel_manager_data.safe_lock(|channel_manager_data| {
-            if channel_manager_data.mode == ChannelMode::Aggregated {
-                if let Some(upstream_channel) = &channel_manager_data.upstream_extended_channel {
-                    if let Ok(mut upstream_extended_channel) = upstream_channel.write() {
-                        _ = upstream_extended_channel.on_set_new_prev_hash(m_static.clone());
-                    }
-                }
-                channel_manager_data
-                    .extended_channels
-                    .iter()
-                    .for_each(|(_, channel)| {
-                        if let Ok(mut channel) = channel.write() {
-                            _ = channel.on_set_new_prev_hash(m_static.clone());
-                        }
-                    });
-            } else if let Some(channel) = channel_manager_data
-                .extended_channels
-                .get(&m_static.channel_id)
-            {
-                if let Ok(mut channel) = channel.write() {
-                    _ = channel.on_set_new_prev_hash(m_static.clone());
-                }
-            }
-        });
 
+        // we update the channel states and keep track of the messages that need to be sent to the
+        // SV1Server
+        let new_extended_mining_job_messages_sv1_server = self
+            .channel_manager_data
+            .super_safe_lock(|channel_manager_data| {
+                let mut new_extended_mining_job_messages = Vec::new();
+
+                if channel_manager_data.mode == ChannelMode::Aggregated {
+                    let aggregated_channel_guard = channel_manager_data
+                        .upstream_extended_channel
+                        .as_ref()
+                        .ok_or(TproxyError::fallback(TproxyErrorKind::ChannelNotFound))?;
+                    let mut aggregated_channel = aggregated_channel_guard.write().map_err(|e| {
+                        error!("Failed to read upstream channel: {:?}", e);
+                        TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                    })?;
+
+                    // does aggregated channel belong to some group channel?
+                    // here, we are assuming that since we are in aggregated mode, there should be
+                    // only one single group channle and the aggregated channel
+                    // must belong to it
+                    let group_channel = channel_manager_data.group_channels.values().next();
+                    let Some(group_channel) = group_channel else {
+                        error!("Aggregated channel does not belong to any group channel");
+                        return Err(TproxyError::fallback(TproxyErrorKind::ChannelNotFound));
+                    };
+
+                    let group_channel_guard = group_channel.read().map_err(|e| {
+                        error!("Failed to read group channel: {:?}", e);
+                        TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                    })?;
+
+                    let group_channel_id = group_channel_guard.get_group_channel_id();
+
+                    // was the message sent to the aggregated channel?
+                    if aggregated_channel.get_channel_id() == m.channel_id
+                        || group_channel_id == m.channel_id
+                    {
+                        // update aggregated channel state
+                        aggregated_channel
+                            .on_set_new_prev_hash(m_static.clone())
+                            .map_err(|e| {
+                                error!("Failed to set new prev hash: {:?}", e);
+                                TproxyError::fallback(
+                                    TproxyErrorKind::FailedToProcessSetNewPrevHash,
+                                )
+                            })?;
+
+                        // update each extended channel state
+                        for (_, channel) in channel_manager_data.extended_channels.iter() {
+                            let mut channel = channel.write().map_err(|e| {
+                                error!("Failed to write channel: {:?}", e);
+                                TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                            })?;
+                            channel
+                                .on_set_new_prev_hash(m_static.clone())
+                                .map_err(|e| {
+                                    error!("Failed to set new prev hash: {:?}", e);
+                                    TproxyError::fallback(
+                                        TproxyErrorKind::FailedToProcessSetNewPrevHash,
+                                    )
+                                })?;
+                        }
+
+                        // for the aggregated channel, send one NewExtendedMiningJob message to
+                        // the SV1Server
+                        let mut new_extended_mining_job_message = aggregated_channel
+                            .get_active_job()
+                            .expect("active job must exist")
+                            .clone();
+                        new_extended_mining_job_message.0.channel_id = AGGREGATED_CHANNEL_ID;
+                        new_extended_mining_job_messages.push(new_extended_mining_job_message.0);
+                    } else {
+                        // we got a nonsense channel id, we should log an error and ignore the
+                        // message
+                        warn!(
+                            "Channel not found: {}, ignoring SetNewPrevHash message",
+                            m_static.channel_id
+                        );
+                        return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
+                    }
+                // we are not in aggregated mode.. was the message sent to a group channel?
+                } else if let Some(group_channel_arc) =
+                    channel_manager_data.group_channels.get(&m.channel_id)
+                {
+                    let mut group_channel = group_channel_arc.write().map_err(|e| {
+                        error!("Failed to read group channel: {:?}", e);
+                        TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                    })?;
+
+                    // update group channel state
+                    group_channel
+                        .on_set_new_prev_hash(m_static.clone())
+                        .map_err(|e| {
+                            error!("Failed to set new prev hash: {:?}", e);
+                            TproxyError::fallback(TproxyErrorKind::FailedToProcessSetNewPrevHash)
+                        })?;
+
+                    // there's no aggregated channel, so we need to process the message for each
+                    // individual channel on the group
+                    for channel_id in group_channel.get_channel_ids() {
+                        let channel = channel_manager_data
+                            .extended_channels
+                            .get(channel_id)
+                            .ok_or(TproxyError::fallback(TproxyErrorKind::ChannelNotFound))?;
+                        let mut channel = channel.write().map_err(|e| {
+                            error!("Failed to write channel: {:?}", e);
+                            TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                        })?;
+                        channel
+                            .on_set_new_prev_hash(m_static.clone())
+                            .map_err(|e| {
+                                error!("Failed to set new prev hash: {:?}", e);
+                                TproxyError::fallback(
+                                    TproxyErrorKind::FailedToProcessSetNewPrevHash,
+                                )
+                            })?;
+
+                        // for each extended channel, send one NewExtendedMiningJob message to
+                        // the SV1Server
+                        let new_extended_mining_job_message = channel
+                            .get_active_job()
+                            .expect("active job must exist")
+                            .clone();
+                        new_extended_mining_job_messages.push(new_extended_mining_job_message.0);
+                    }
+                // if the message was not sent to a group channel, and we're not in aggregated
+                // mode, we need to process the message for a specific channel
+                } else {
+                    let Some(channel) = channel_manager_data
+                        .extended_channels
+                        .get(&m_static.channel_id)
+                    else {
+                        // we got a nonsense channel id, we should log an error and ignore the
+                        // message
+                        warn!(
+                            "Channel not found: {}, ignoring SetNewPrevHash message",
+                            m_static.channel_id
+                        );
+                        return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
+                    };
+
+                    let mut channel = channel.write().map_err(|e| {
+                        error!("Failed to write channel: {:?}", e);
+                        TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                    })?;
+
+                    // update channel state
+                    channel
+                        .on_set_new_prev_hash(m_static.clone())
+                        .map_err(|e| {
+                            error!("Failed to set new prev hash: {:?}", e);
+                            TproxyError::fallback(TproxyErrorKind::FailedToProcessSetNewPrevHash)
+                        })?;
+
+                    // for the channel, send one NewExtendedMiningJob message to the SV1Server
+                    let new_extended_mining_job_message = channel
+                        .get_active_job()
+                        .expect("active job must exist")
+                        .clone();
+                    new_extended_mining_job_messages.push(new_extended_mining_job_message.0);
+                }
+                Ok::<Vec<NewExtendedMiningJob<'static>>, Self::Error>(
+                    new_extended_mining_job_messages,
+                )
+            })?;
+
+        // we need to send the only one SetNewPrevHash message to the SV1Server
         self.channel_state
             .sv1_server_sender
-            .send((Mining::SetNewPrevHash(m_static.clone()), None))
+            .send((Mining::SetNewPrevHash(m_static), None))
             .await
             .map_err(|e| {
                 error!("Failed to send SetNewPrevHash: {:?}", e);
                 TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
             })?;
 
-        let mode = self
-            .channel_manager_data
-            .super_safe_lock(|c| c.mode.clone());
-
-        let active_job = if mode == ChannelMode::Aggregated {
-            self.channel_manager_data.super_safe_lock(|c| {
-                c.upstream_extended_channel
-                    .as_ref()
-                    .and_then(|ch| ch.read().ok())
-                    .and_then(|ch| ch.get_active_job().map(|j| j.0.clone()))
-            })
-        } else {
-            self.channel_manager_data.super_safe_lock(|c| {
-                c.extended_channels
-                    .get(&m.channel_id)
-                    .and_then(|ch| ch.read().ok())
-                    .and_then(|ch| ch.get_active_job().map(|j| j.0.clone()))
-            })
-        };
-
-        if let Some(mut job) = active_job {
-            if mode == ChannelMode::Aggregated {
-                job.channel_id = 0;
-            }
+        // we need to send the NewExtendedMiningJob message(s) to the SV1Server
+        for message in new_extended_mining_job_messages_sv1_server {
             self.channel_state
                 .sv1_server_sender
-                .send((Mining::NewExtendedMiningJob(job), None))
+                .send((Mining::NewExtendedMiningJob(message), None))
                 .await
                 .map_err(|e| {
                     error!("Failed to send NewExtendedMiningJob: {:?}", e);
                     TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
                 })?;
         }
+
         Ok(())
     }
 
@@ -506,45 +838,150 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {}", m);
 
-        // Update the channel targets in the channel manager
-        _ = self.channel_manager_data.safe_lock(|channel_manager_data| {
-            if channel_manager_data.mode == ChannelMode::Aggregated {
-                if let Some(upstream_channel) = &channel_manager_data.upstream_extended_channel {
-                    if let Ok(mut upstream_extended_channel) = upstream_channel.write() {
-                        upstream_extended_channel.set_target(Target::from_le_bytes(
-                            m.maximum_target.inner_as_ref().try_into().unwrap(),
-                        ));
-                    }
-                }
-                channel_manager_data
-                    .extended_channels
-                    .iter()
-                    .for_each(|(_, channel)| {
-                        if let Ok(mut channel) = channel.write() {
-                            channel.set_target(Target::from_le_bytes(
-                                m.maximum_target.inner_as_ref().try_into().unwrap(),
-                            ));
-                        }
-                    });
-            } else if let Some(channel) = channel_manager_data.extended_channels.get(&m.channel_id)
-            {
-                if let Ok(mut channel) = channel.write() {
-                    channel.set_target(Target::from_le_bytes(
-                        m.maximum_target.inner_as_ref().try_into().unwrap(),
-                    ));
-                }
-            }
-        });
+        let m_static = m.clone().into_static();
 
-        // Forward SetTarget message to SV1Server for vardiff processing
-        self.channel_state
-            .sv1_server_sender
-            .send((Mining::SetTarget(m.clone().into_static()), None))
-            .await
-            .map_err(|e| {
-                error!("Failed to forward SetTarget message to SV1Server: {:?}", e);
-                TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
-            })?;
+        // Update the channel targets in the channel manager
+        let set_target_messages_sv1_server =
+            self.channel_manager_data
+                .super_safe_lock(|channel_manager_data| {
+                    let mut set_target_messages = Vec::new();
+
+                    // are in aggregated mode?
+                    if channel_manager_data.mode == ChannelMode::Aggregated {
+                        let aggregated_channel = channel_manager_data
+                            .upstream_extended_channel
+                            .as_ref()
+                            .ok_or(TproxyError::fallback(TproxyErrorKind::ChannelNotFound))?;
+                        let mut aggregated_extended_channel =
+                            aggregated_channel.write().map_err(|e| {
+                                error!("Failed to write upstream channel: {:?}", e);
+                                TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                            })?;
+
+                        // does aggregated channel belong to some group channel?
+                        // here, we are assuming that since we are in aggregated mode, there should
+                        // be only one single group channle and the
+                        // aggregated channel must belong to it
+                        let group_channel = channel_manager_data.group_channels.values().next();
+                        let Some(group_channel) = group_channel else {
+                            error!("Aggregated channel does not belong to any group channel");
+                            return Err(TproxyError::fallback(TproxyErrorKind::ChannelNotFound));
+                        };
+
+                        let group_channel_guard = group_channel.read().map_err(|e| {
+                            error!("Failed to read group channel: {:?}", e);
+                            TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                        })?;
+
+                        let group_channel_id = group_channel_guard.get_group_channel_id();
+
+                        // was the message sent to the aggregated channel?
+                        if aggregated_extended_channel.get_channel_id() == m.channel_id
+                            || group_channel_id == m.channel_id
+                        {
+                            aggregated_extended_channel.set_target(Target::from_le_bytes(
+                                m.maximum_target
+                                    .inner_as_ref()
+                                    .try_into()
+                                    .expect("target deserialization should never fail"),
+                            ));
+                            channel_manager_data.extended_channels.iter().for_each(
+                                |(_, channel)| {
+                                    if let Ok(mut channel) = channel.write() {
+                                        channel.set_target(Target::from_le_bytes(
+                                            m.maximum_target
+                                                .inner_as_ref()
+                                                .try_into()
+                                                .expect("target deserialization should never fail"),
+                                        ));
+                                    }
+                                },
+                            );
+
+                            let mut message = m_static.clone();
+                            message.channel_id = AGGREGATED_CHANNEL_ID;
+                            set_target_messages.push(message);
+                        } else {
+                            // we got a nonsense channel id, we should log an error and ignore the
+                            // message
+                            warn!(
+                                "Channel not found: {}, ignoring SetTarget message",
+                                m_static.channel_id
+                            );
+                            return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
+                        }
+                    // we are not in aggregated mode... was the message sent to a group channel?
+                    } else if let Some(group_channel_arc) =
+                        channel_manager_data.group_channels.get(&m.channel_id)
+                    {
+                        let group_channel = group_channel_arc.read().map_err(|e| {
+                            error!("Failed to read group channel: {:?}", e);
+                            TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                        })?;
+
+                        // process the message for each individual channel on the group
+                        for channel_id in group_channel.get_channel_ids() {
+                            let channel = channel_manager_data
+                                .extended_channels
+                                .get(channel_id)
+                                .ok_or(TproxyError::fallback(TproxyErrorKind::ChannelNotFound))?;
+                            let mut channel = channel.write().map_err(|e| {
+                                error!("Failed to write channel: {:?}", e);
+                                TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                            })?;
+                            channel.set_target(Target::from_le_bytes(
+                                m.maximum_target
+                                    .inner_as_ref()
+                                    .try_into()
+                                    .expect("target deserialization should never fail"),
+                            ));
+
+                            let mut message = m_static.clone();
+                            message.channel_id = *channel_id;
+                            set_target_messages.push(message);
+                        }
+                    // if the message was not sent to a group channel, and we're not in aggregated
+                    // mode, we need to process the message for a specific channel
+                    } else {
+                        let Some(channel) =
+                            channel_manager_data.extended_channels.get(&m.channel_id)
+                        else {
+                            // we got a nonsense channel id, we should log an error and ignore the
+                            // message
+                            warn!(
+                                "Channel not found: {}, ignoring SetTarget message",
+                                m_static.channel_id
+                            );
+                            return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
+                        };
+                        let mut channel_guard = channel.write().map_err(|e| {
+                            error!("Failed to write channel: {:?}", e);
+                            TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                        })?;
+                        channel_guard.set_target(Target::from_le_bytes(
+                            m.maximum_target
+                                .inner_as_ref()
+                                .try_into()
+                                .expect("target deserialization should never fail"),
+                        ));
+
+                        set_target_messages.push(m_static.clone());
+                    }
+
+                    Ok::<Vec<SetTarget<'static>>, Self::Error>(set_target_messages)
+                })?;
+
+        // now we need to send the SetTarget message(s) to the SV1Server
+        for message in set_target_messages_sv1_server {
+            self.channel_state
+                .sv1_server_sender
+                .send((Mining::SetTarget(message), None))
+                .await
+                .map_err(|e| {
+                    error!("Failed to send SetTarget: {:?}", e);
+                    TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
+                })?;
+        }
 
         Ok(())
     }
@@ -555,11 +992,123 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         m: SetGroupChannel<'_>,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        warn!("Received: {}", m);
-        warn!("⚠️ Cannot process SetGroupChannel since Translator Proxy does not support group channels. Ignoring.");
-        Err(TproxyError::log(TproxyErrorKind::UnexpectedMessage(
-            0,
-            MESSAGE_TYPE_SET_GROUP_CHANNEL,
-        )))
+        info!("Received: {}", m);
+
+        self.channel_manager_data
+            .super_safe_lock(|channel_manager_data| {
+                // remove every channel from any group channels that end up empty
+                let mut group_channels_to_remove = Vec::new();
+
+                // check every group channel if it contains any of the channels in the new group
+                // channel
+                for (group_channel_id, group_channel) in channel_manager_data.group_channels.iter()
+                {
+                    let mut group_channel = group_channel.write().map_err(|e| {
+                        error!("Failed to write group channel: {:?}", e);
+                        TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                    })?;
+                    let channel_ids_to_remove = m.channel_ids.clone().into_inner();
+                    for channel_id in channel_ids_to_remove {
+                        group_channel.remove_channel_id(channel_id);
+                    }
+
+                    if group_channel.get_channel_ids().is_empty() {
+                        group_channels_to_remove.push(*group_channel_id);
+                    }
+                }
+
+                // Now remove the empty group channels
+                for group_channel_id in group_channels_to_remove {
+                    channel_manager_data
+                        .group_channels
+                        .remove(&group_channel_id);
+                }
+
+                // does the group channel already exist?
+                match channel_manager_data.group_channels.get(&m.group_channel_id) {
+                    // if yes, clean up any channels that are no longer in the new group channel
+                    Some(group_channel_arc) => {
+                        let mut group_channel = group_channel_arc.write().map_err(|e| {
+                            error!("Failed to write group channel: {:?}", e);
+                            TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                        })?;
+                        let current_channel_ids = group_channel.get_channel_ids().clone();
+                        let new_channel_ids = m.channel_ids.clone().into_inner();
+
+                        // Remove channels that are no longer in the new list
+                        for channel_id in &current_channel_ids {
+                            if !new_channel_ids.contains(channel_id) {
+                                group_channel.remove_channel_id(*channel_id);
+                            }
+                        }
+
+                        // Add all channels from the message (inner HashSet ingores duplicates)
+                        for channel_id in new_channel_ids {
+                            let full_extranonce_size = {
+                                let extended_channel_guard = channel_manager_data
+                                    .extended_channels
+                                    .get(&channel_id)
+                                    .ok_or(TproxyError::fallback(
+                                        TproxyErrorKind::ChannelNotFound,
+                                    ))?;
+                                extended_channel_guard
+                                    .read()
+                                    .map_err(|e| {
+                                        error!("Failed to read extended channel: {:?}", e);
+                                        TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                                    })?
+                                    .get_full_extranonce_size()
+                            };
+                            group_channel
+                                .add_channel_id(channel_id, full_extranonce_size)
+                                .map_err(|e| {
+                                    error!("Failed to add channel id to group channel: {:?}", e);
+                                    TproxyError::fallback(
+                                        TproxyErrorKind::FailedToAddChannelIdToGroupChannel(e),
+                                    )
+                                })?;
+                        }
+                    }
+                    // if no, create a new group channel, and add all the channels to it
+                    None => {
+                        let mut group_channel = GroupChannel::new(m.group_channel_id);
+
+                        // Add all channels to the newly created group channel
+                        for channel_id in m.channel_ids.clone().into_inner() {
+                            let full_extranonce_size = {
+                                let extended_channel_guard = channel_manager_data
+                                    .extended_channels
+                                    .get(&channel_id)
+                                    .ok_or(TproxyError::fallback(
+                                        TproxyErrorKind::ChannelNotFound,
+                                    ))?;
+                                extended_channel_guard
+                                    .read()
+                                    .map_err(|e| {
+                                        error!("Failed to read extended channel: {:?}", e);
+                                        TproxyError::shutdown(TproxyErrorKind::PoisonLock)
+                                    })?
+                                    .get_full_extranonce_size()
+                            };
+                            group_channel
+                                .add_channel_id(channel_id, full_extranonce_size)
+                                .map_err(|e| {
+                                    error!("Failed to add channel id to group channel: {:?}", e);
+                                    TproxyError::fallback(
+                                        TproxyErrorKind::FailedToAddChannelIdToGroupChannel(e),
+                                    )
+                                })?;
+                        }
+
+                        channel_manager_data
+                            .group_channels
+                            .insert(m.group_channel_id, Arc::new(RwLock::new(group_channel)));
+                    }
+                }
+
+                Ok::<(), Self::Error>(())
+            })?;
+
+        Ok(())
     }
 }

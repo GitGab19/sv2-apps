@@ -5,7 +5,8 @@ use std::{
 use stratum_apps::{
     custom_mutex::Mutex,
     stratum_core::{
-        channels_sv2::client::extended::ExtendedChannel, mining_sv2::ExtendedExtranonce,
+        channels_sv2::client::{extended::ExtendedChannel, group::GroupChannel},
+        mining_sv2::ExtendedExtranonce,
     },
     utils::types::{ChannelId, DownstreamId, Hashrate},
 };
@@ -40,6 +41,8 @@ pub struct ChannelManagerData {
     pub pending_channels: HashMap<DownstreamId, (String, Hashrate, usize)>,
     /// Map of active extended channels by channel ID
     pub extended_channels: HashMap<ChannelId, Arc<RwLock<ExtendedChannel<'static>>>>,
+    /// Map of active group channels by group channel ID
+    pub group_channels: HashMap<ChannelId, Arc<RwLock<GroupChannel<'static>>>>,
     /// The upstream extended channel used in aggregated mode
     pub upstream_extended_channel: Option<Arc<RwLock<ExtendedChannel<'static>>>>,
     /// Extranonce prefix factory for allocating unique prefixes in aggregated mode
@@ -72,6 +75,7 @@ impl ChannelManagerData {
         Self {
             pending_channels: HashMap::new(),
             extended_channels: HashMap::new(),
+            group_channels: HashMap::new(),
             upstream_extended_channel: None,
             extranonce_prefix_factory: None,
             mode,

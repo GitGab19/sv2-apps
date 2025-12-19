@@ -1,4 +1,7 @@
-use crate::sv1::sv1_server::data::{PendingTargetUpdate, Sv1ServerData};
+use crate::{
+    sv1::sv1_server::data::{PendingTargetUpdate, Sv1ServerData},
+    utils::AGGREGATED_CHANNEL_ID,
+};
 use async_channel::Sender;
 use std::sync::Arc;
 use stratum_apps::{
@@ -576,9 +579,9 @@ impl DifficultyManager {
 
         let (total_hashrate, min_target, channel_id, downstream_count) = sv1_server_data
             .super_safe_lock(|data| {
-                // Hardcoded channel_id 0 (the ChannelManager will set this channel_id to the
-                // upstream extended channel id)
-                let channel_id = 0;
+                // Hardcoded channel_id AGGREGATED_CHANNEL_ID (the ChannelManager will set this
+                // channel_id to the upstream extended channel)
+                let channel_id = AGGREGATED_CHANNEL_ID;
 
                 let total_hashrate: Hashrate = data
                     .downstreams

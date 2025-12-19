@@ -6,7 +6,7 @@ use crate::{
         downstream::{channel::DownstreamChannelState, data::DownstreamData},
         sv1_server::data::Sv1ServerData,
     },
-    utils::ShutdownMessage,
+    utils::{ShutdownMessage, AGGREGATED_CHANNEL_ID},
 };
 use async_channel::{Receiver, Sender};
 use std::{sync::Arc, time::Instant};
@@ -200,7 +200,8 @@ impl Downstream {
                                 .load(std::sync::atomic::Ordering::SeqCst),
                         )
                     });
-                let id_matches = (my_channel_id == Some(channel_id) || channel_id == 0)
+                let id_matches = (my_channel_id == Some(channel_id)
+                    || channel_id == AGGREGATED_CHANNEL_ID)
                     && (downstream_id.is_none() || downstream_id == Some(my_downstream_id));
                 if !id_matches {
                     return Ok(()); // Message not intended for this downstream

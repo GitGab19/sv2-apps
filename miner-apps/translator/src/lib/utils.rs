@@ -24,6 +24,10 @@ use tracing::debug;
 
 use crate::error::TproxyErrorKind;
 
+/// Channel ID used to broadcast messages to all downstreams in aggregated mode.
+/// This sentinel value distinguishes broadcast from a legitimate channel 0.
+pub const AGGREGATED_CHANNEL_ID: ChannelId = u32::MAX;
+
 /// Validates an SV1 share against the target difficulty and job parameters.
 ///
 /// This function performs complete share validation by:
