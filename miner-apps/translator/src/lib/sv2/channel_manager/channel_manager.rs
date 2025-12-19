@@ -344,6 +344,8 @@ impl ChannelManager {
                                         target: target.to_le_bytes().into(),
                                         extranonce_size: new_extranonce_size as u16,
                                         extranonce_prefix: new_extranonce_prefix.clone().into(),
+                                        group_channel_id: 0, /* use a dummy value, this shouldn't
+                                                              * matter for the Sv1 server */
                                     },
                                 );
 

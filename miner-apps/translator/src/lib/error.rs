@@ -16,7 +16,9 @@ use std::{
 };
 use stratum_apps::{
     stratum_core::{
-        binary_sv2, framing_sv2,
+        binary_sv2,
+        channels_sv2::client::error::GroupChannelError,
+        framing_sv2,
         handlers_sv2::HandlerErrorType,
         noise_sv2,
         parsers_sv2::{self, ParserError, TlvError},
@@ -186,6 +188,16 @@ pub enum TproxyErrorKind {
     OpenMiningChannelError,
     /// Could not initiate subsystem
     CouldNotInitiateSystem,
+    /// Channel not found
+    ChannelNotFound,
+    /// Failed to process SetNewPrevHash message
+    FailedToProcessSetNewPrevHash,
+    /// Failed to process NewExtendedMiningJob message
+    FailedToProcessNewExtendedMiningJob,
+    /// Failed to add channel id to group channel
+    FailedToAddChannelIdToGroupChannel(GroupChannelError),
+    /// Aggregated channel was closed
+    AggregatedChannelClosed,
 }
 
 impl std::error::Error for TproxyErrorKind {}
@@ -250,6 +262,15 @@ impl fmt::Display for TproxyErrorKind {
             OpenMiningChannelError => write!(f, "failed to open mining channel"),
             SetupConnectionError => write!(f, "failed to setup connection with upstream"),
             CouldNotInitiateSystem => write!(f, "Could not initiate subsystem"),
+            ChannelNotFound => write!(f, "Channel not found"),
+            FailedToProcessSetNewPrevHash => write!(f, "Failed to process SetNewPrevHash message"),
+            FailedToProcessNewExtendedMiningJob => {
+                write!(f, "Failed to process NewExtendedMiningJob message")
+            }
+            FailedToAddChannelIdToGroupChannel(ref e) => {
+                write!(f, "Failed to add channel id to group channel: {e:?}")
+            }
+            AggregatedChannelClosed => write!(f, "Aggregated channel was closed"),
         }
     }
 }
