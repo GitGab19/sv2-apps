@@ -1,7 +1,8 @@
 use std::sync::atomic::Ordering;
 
 use stratum_apps::stratum_core::{
-    bitcoin::Amount,
+    bitcoin::{Amount, TxOut},
+    bitcoin::consensus::Decodable,
     channels_sv2::outputs::deserialize_outputs,
     handlers_sv2::HandleTemplateDistributionMessagesFromServerAsync,
     mining_sv2::SetNewPrevHash as SetNewPrevHashMp,
@@ -81,8 +82,25 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                     match msg.future_template {
                         true => {
                             for (channel_id, standard_channel) in data.standard_channels.iter_mut() {
+                                // Use solo coinbase output if available for this channel
+                                let channel_coinbase = match data.solo_coinbase_outputs.get(channel_id) {
+                                    Some(solo_coinbase_bytes) => {
+                                        match TxOut::consensus_decode(&mut solo_coinbase_bytes.as_slice()) {
+                                            Ok(mut solo_output) => {
+                                                solo_output.value = Amount::from_sat(msg.coinbase_tx_value_remaining);
+                                                vec![solo_output]
+                                            }
+                                            Err(_) => {
+                                                tracing::error!("Failed to deserialize solo coinbase output for channel {channel_id:?}, falling back to pool coinbase");
+                                                coinbase_output.clone()
+                                            }
+                                        }
+                                    }
+                                    None => coinbase_output.clone(),
+                                };
+                                
                                 if data.group_channels.is_none() {
-                                    if let Err(e) = standard_channel.on_new_template(msg.clone().into_static(), coinbase_output.clone()) {
+                                    if let Err(e) = standard_channel.on_new_template(msg.clone().into_static(), channel_coinbase.clone()) {
                                         tracing::error!("Error while adding template to standard channel: {channel_id:?} {e:?}");
                                         continue;
                                     }
@@ -92,7 +110,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                     messages.push((*downstream_id, Mining::NewMiningJob(standard_job_message.clone())).into());
                                 }
                                 if let Some(ref group_channel_job) = group_channel_job {
-                                    if let Err(e) = standard_channel.on_new_template(msg.clone().into_static(), coinbase_output.clone()) {
+                                    if let Err(e) = standard_channel.on_new_template(msg.clone().into_static(), channel_coinbase.clone()) {
                                         tracing::error!("Error while adding template to standard channel: {channel_id:?} {e:?}");
                                         continue;
                                     }
@@ -106,8 +124,25 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                             }
 
                             for (channel_id, extended_channel) in data.extended_channels.iter_mut() {
-                                if let Err(e) = extended_channel.on_new_template(msg.clone().into_static(), coinbase_output.clone()) {
-                                    tracing::error!("Error while adding template to standard channel: {channel_id:?} {e:?}");
+                                // Use solo coinbase output if available for this channel
+                                let channel_coinbase = match data.solo_coinbase_outputs.get(channel_id) {
+                                    Some(solo_coinbase_bytes) => {
+                                        match TxOut::consensus_decode(&mut solo_coinbase_bytes.as_slice()) {
+                                            Ok(mut solo_output) => {
+                                                solo_output.value = Amount::from_sat(msg.coinbase_tx_value_remaining);
+                                                vec![solo_output]
+                                            }
+                                            Err(_) => {
+                                                tracing::error!("Failed to deserialize solo coinbase output for channel {channel_id:?}, falling back to pool coinbase");
+                                                coinbase_output.clone()
+                                            }
+                                        }
+                                    }
+                                    None => coinbase_output.clone(),
+                                };
+                                
+                                if let Err(e) = extended_channel.on_new_template(msg.clone().into_static(), channel_coinbase.clone()) {
+                                    tracing::error!("Error while adding template to extended channel: {channel_id:?} {e:?}");
                                     continue;
                                 }
                                 let extended_job_id = extended_channel
@@ -125,8 +160,25 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                         }
                         false => {
                             for (channel_id, standard_channel) in data.standard_channels.iter_mut() {
+                                // Use solo coinbase output if available for this channel
+                                let channel_coinbase = match data.solo_coinbase_outputs.get(channel_id) {
+                                    Some(solo_coinbase_bytes) => {
+                                        match TxOut::consensus_decode(&mut solo_coinbase_bytes.as_slice()) {
+                                            Ok(mut solo_output) => {
+                                                solo_output.value = Amount::from_sat(msg.coinbase_tx_value_remaining);
+                                                vec![solo_output]
+                                            }
+                                            Err(_) => {
+                                                tracing::error!("Failed to deserialize solo coinbase output for channel {channel_id:?}, falling back to pool coinbase");
+                                                coinbase_output.clone()
+                                            }
+                                        }
+                                    }
+                                    None => coinbase_output.clone(),
+                                };
+                                
                                 if data.group_channels.is_none() {
-                                    if let Err(e) = standard_channel.on_new_template(msg.clone().into_static(), coinbase_output.clone()) {
+                                    if let Err(e) = standard_channel.on_new_template(msg.clone().into_static(), channel_coinbase.clone()) {
                                         tracing::error!("Error while adding template to standard channel: {channel_id:?} {e:?}");
                                         continue;
                                     }
@@ -135,7 +187,7 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                                     messages.push((*downstream_id, Mining::NewMiningJob(standard_job_message.clone())).into());
                                 }
                                 if let Some(ref group_channel_job) = group_channel_job {
-                                    if let Err(e) = standard_channel.on_new_template(msg.clone().into_static(), coinbase_output.clone()) {
+                                    if let Err(e) = standard_channel.on_new_template(msg.clone().into_static(), channel_coinbase.clone()) {
                                         tracing::error!("Error while adding template to standard channel: {channel_id:?} {e:?}");
                                         continue;
                                     }
@@ -149,8 +201,25 @@ impl HandleTemplateDistributionMessagesFromServerAsync for ChannelManager {
                             }
 
                             for (channel_id, extended_channel) in data.extended_channels.iter_mut() {
-                                if let Err(e) = extended_channel.on_new_template(msg.clone().into_static(), coinbase_output.clone()) {
-                                    tracing::error!("Error while adding template to standard channel: {channel_id:?} {e:?}");
+                                // Use solo coinbase output if available for this channel
+                                let channel_coinbase = match data.solo_coinbase_outputs.get(channel_id) {
+                                    Some(solo_coinbase_bytes) => {
+                                        match TxOut::consensus_decode(&mut solo_coinbase_bytes.as_slice()) {
+                                            Ok(mut solo_output) => {
+                                                solo_output.value = Amount::from_sat(msg.coinbase_tx_value_remaining);
+                                                vec![solo_output]
+                                            }
+                                            Err(_) => {
+                                                tracing::error!("Failed to deserialize solo coinbase output for channel {channel_id:?}, falling back to pool coinbase");
+                                                coinbase_output.clone()
+                                            }
+                                        }
+                                    }
+                                    None => coinbase_output.clone(),
+                                };
+                                
+                                if let Err(e) = extended_channel.on_new_template(msg.clone().into_static(), channel_coinbase.clone()) {
+                                    tracing::error!("Error while adding template to extended channel: {channel_id:?} {e:?}");
                                     continue;
                                 }
                                 let extended_job = extended_channel

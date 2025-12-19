@@ -50,6 +50,7 @@ mod extensions_message_handler;
 /// - Active [`ExtendedChannel`]s keyed by channel ID.
 /// - Active [`StandardChannel`]s keyed by channel ID.
 /// - Extensions that have been successfully negotiated with this client
+/// - Per-channel coinbase outputs for solo mining (channel_id -> coinbase_output)
 pub struct DownstreamData {
     pub group_channels: Option<GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>>,
     pub extended_channels:
@@ -59,6 +60,8 @@ pub struct DownstreamData {
     pub channel_id_factory: AtomicU32,
     /// Extensions that have been successfully negotiated with this client
     pub negotiated_extensions: Vec<u16>,
+    /// Per-channel coinbase outputs for solo mining channels
+    pub solo_coinbase_outputs: HashMap<ChannelId, Vec<u8>>,
 }
 
 /// Communication layer for a downstream connection.
@@ -138,6 +141,7 @@ impl Downstream {
             group_channels: None,
             channel_id_factory: AtomicU32::new(1),
             negotiated_extensions: vec![],
+            solo_coinbase_outputs: HashMap::new(),
         }));
         Downstream {
             downstream_channel,

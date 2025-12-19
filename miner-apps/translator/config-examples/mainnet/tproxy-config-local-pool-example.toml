@@ -14,7 +14,7 @@ downstream_extranonce2_size = 4
 
 # User identity/username for pool connection
 # This will be appended with a counter for each mining client (e.g., username.miner1, username.miner2)
-user_identity = "your_username_here"
+user_identity = "bc1q9f9vj7spn8h7qda6pn8d4g4j99f0mn9lhwz55j"
 
 # Aggregate channels: if true, all miners share one upstream channel; if false, each miner gets its own channel
 aggregate_channels = true

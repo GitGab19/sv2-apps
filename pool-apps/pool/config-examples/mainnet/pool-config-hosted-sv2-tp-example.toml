@@ -40,6 +40,8 @@ required_extensions = [
     # 0x0002,
 ]
 
+solo_mining_enabled = true
+
 # Hosted Sv2 Template Provider config
 [template_provider_type.Sv2Tp]
 address = "75.119.150.111:8442"

@@ -29,6 +29,45 @@ use crate::{
     error::PoolError,
 };
 
+/// Helper function to parse a Bitcoin address from user_identity and create a coinbase output.
+/// Returns the encoded coinbase output bytes if successful, or None if parsing fails.
+/// 
+/// Truncates user_identity at the first dot (.) to handle cases where translator proxies
+/// append suffixes like ".translator-proxy" to the Bitcoin address.
+fn create_solo_coinbase_output(user_identity: &str) -> Result<Vec<u8>, PoolError> {
+    use stratum_apps::{
+        config_helpers::CoinbaseRewardScript,
+        stratum_core::bitcoin::{consensus::Encodable, Amount, TxOut},
+    };
+
+    // Truncate at the first dot to extract just the Bitcoin address
+    // This handles cases where translator proxies append suffixes like ".translator-proxy"
+    let bitcoin_address = if let Some(dot_index) = user_identity.find('.') {
+        &user_identity[..dot_index]
+    } else {
+        user_identity
+    };
+
+    // Try to parse the truncated user_identity as a Bitcoin address
+    let coinbase_script = CoinbaseRewardScript::from_descriptor(&format!("addr({bitcoin_address})"))
+        .map_err(|e| {
+            error!("Failed to parse user_identity as Bitcoin address: {user_identity} (truncated to: {bitcoin_address}), error: {e:?}");
+            PoolError::CoinbaseOutput(e)
+        })?;
+
+    let coinbase_output = TxOut {
+        value: Amount::from_sat(0), // Value will be set later from template
+        script_pubkey: coinbase_script.script_pubkey(),
+    };
+
+    let mut encoded = vec![];
+    coinbase_output
+        .consensus_encode(&mut encoded)
+        .expect("Failed to encode coinbase output");
+
+    Ok(encoded)
+}
+
 impl HandleMiningMessagesFromClientAsync for ChannelManager {
     type Error = PoolError;
 
@@ -137,7 +176,6 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 return Err(PoolError::LastNewPrevhashNotFound);
             };
 
-
             let pool_coinbase_output = TxOut {
                 value: Amount::from_sat(last_future_template.coinbase_tx_value_remaining),
                 script_pubkey: self.coinbase_reward_script.script_pubkey(),
@@ -155,6 +193,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             return Err(PoolError::FailedToCreateGroupChannel(e));
                         }
                     };
+                    // Group channels always use pool coinbase output (not solo)
                     group_channel.on_new_template(last_future_template.clone(), vec![pool_coinbase_output.clone()])?;
 
                     group_channel.on_set_new_prev_hash(last_set_new_prev_hash_tdp.clone())?;
@@ -165,6 +204,20 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 let extranonce_prefix = channel_manager_data.extranonce_prefix_factory_standard.next_prefix_standard()?;
 
                 let channel_id = downstream_data.channel_id_factory.fetch_add(1, Ordering::SeqCst);
+                
+                // Handle solo mining: parse Bitcoin address from user_identity if solo mode is enabled
+                if self.solo_mining_enabled {
+                    match create_solo_coinbase_output(&user_identity) {
+                        Ok(solo_coinbase_bytes) => {
+                            info!("Solo mining enabled for standard channel {channel_id}, storing solo coinbase output");
+                            downstream_data.solo_coinbase_outputs.insert(channel_id, solo_coinbase_bytes);
+                        }
+                        Err(e) => {
+                            error!("Failed to create solo coinbase output from user_identity '{user_identity}': {e:?}. Falling back to pool coinbase.");
+                        }
+                    }
+                }
+                
                 let job_store = DefaultJobStore::new();
 
                 let mut standard_channel = match StandardChannel::new_for_pool(channel_id, user_identity.to_string(), extranonce_prefix.to_vec(), requested_max_target, nominal_hash_rate, self.share_batch_size, self.shares_per_minute, job_store, self.pool_tag_string.clone()) {
@@ -215,8 +268,25 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                 let template_id = last_future_template.template_id;
 
+                // Use solo coinbase output if available, otherwise use pool coinbase output
+                let coinbase_output = if let Some(solo_coinbase_bytes) = downstream_data.solo_coinbase_outputs.get(&channel_id) {
+                    use stratum_apps::stratum_core::bitcoin::consensus::Decodable;
+                    let mut solo_output: TxOut = Decodable::consensus_decode(
+                        &mut solo_coinbase_bytes.as_slice()
+                    ).map_err(|e| {
+                        error!("Failed to decode solo coinbase output: {e:?}");
+                        PoolError::BitcoinEncodeError(e)
+                    })?;
+                    solo_output.value = Amount::from_sat(
+                        last_future_template.coinbase_tx_value_remaining,
+                    );
+                    solo_output
+                } else {
+                    pool_coinbase_output.clone()
+                };
+
                 // create a future standard job based on the last future template
-                standard_channel.on_new_template(last_future_template, vec![pool_coinbase_output.clone()])?;
+                standard_channel.on_new_template(last_future_template, vec![coinbase_output])?;
                 let future_standard_job_id = standard_channel
                     .get_future_job_id_from_template_id(template_id)
                     .expect("future job id must exist");
@@ -431,6 +501,19 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             return Err(PoolError::FutureTemplateNotPresent);
                         };
 
+                        // Handle solo mining: parse Bitcoin address from user_identity if solo mode is enabled
+                        if self.solo_mining_enabled {
+                            match create_solo_coinbase_output(&user_identity) {
+                                Ok(solo_coinbase_bytes) => {
+                                    info!("Solo mining enabled for channel {channel_id}, storing solo coinbase output");
+                                    downstream_data.solo_coinbase_outputs.insert(channel_id, solo_coinbase_bytes);
+                                }
+                                Err(e) => {
+                                    error!("Failed to create solo coinbase output from user_identity '{user_identity}': {e:?}. Falling back to pool coinbase.");
+                                }
+                            }
+                        }
+
                         // if the client requires custom work, we don't need to send any extended
                         // jobs so we just process the SetNewPrevHash
                         // message
@@ -440,16 +523,31 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             // future extended job
                             // and the SetNewPrevHash message
                         } else {
-                            let pool_coinbase_output = TxOut {
-                                value: Amount::from_sat(
+                            // Use solo coinbase output if available, otherwise use pool coinbase output
+                            let coinbase_output = if let Some(solo_coinbase_bytes) = downstream_data.solo_coinbase_outputs.get(&channel_id) {
+                                use stratum_apps::stratum_core::bitcoin::consensus::Decodable;
+                                let mut solo_output: TxOut = Decodable::consensus_decode(
+                                    &mut solo_coinbase_bytes.as_slice()
+                                ).map_err(|e| {
+                                    error!("Failed to decode solo coinbase output: {e:?}");
+                                    PoolError::BitcoinEncodeError(e)
+                                })?;
+                                solo_output.value = Amount::from_sat(
                                     last_future_template.coinbase_tx_value_remaining,
-                                ),
-                                script_pubkey: self.coinbase_reward_script.script_pubkey(),
+                                );
+                                solo_output
+                            } else {
+                                TxOut {
+                                    value: Amount::from_sat(
+                                        last_future_template.coinbase_tx_value_remaining,
+                                    ),
+                                    script_pubkey: self.coinbase_reward_script.script_pubkey(),
+                                }
                             };
 
                             extended_channel.on_new_template(
                                 last_future_template.clone(),
-                                vec![pool_coinbase_output],
+                                vec![coinbase_output],
                             )?;
 
                             let future_extended_job_id = extended_channel

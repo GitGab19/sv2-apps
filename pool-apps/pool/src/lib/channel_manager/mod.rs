@@ -96,6 +96,8 @@ pub struct ChannelManager {
     supported_extensions: Vec<u16>,
     /// Protocol extensions that the pool requires (clients must support these).
     required_extensions: Vec<u16>,
+    /// Whether solo mining mode is enabled
+    solo_mining_enabled: bool,
 }
 
 impl ChannelManager {
@@ -158,6 +160,7 @@ impl ChannelManager {
             coinbase_reward_script: config.coinbase_reward_script().clone(),
             supported_extensions: config.supported_extensions().to_vec(),
             required_extensions: config.required_extensions().to_vec(),
+            solo_mining_enabled: config.solo_mining_enabled(),
         };
 
         Ok(channel_manager)

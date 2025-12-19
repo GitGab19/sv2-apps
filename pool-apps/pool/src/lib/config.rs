@@ -37,6 +37,7 @@ pub struct PoolConfig {
     server_id: u16,
     supported_extensions: Vec<u16>,
     required_extensions: Vec<u16>,
+    solo_mining_enabled: bool,
 }
 
 impl PoolConfig {
@@ -56,6 +57,7 @@ impl PoolConfig {
         server_id: u16,
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
+        solo_mining_enabled: bool,
     ) -> Self {
         Self {
             listen_address: pool_connection.listen_address,
@@ -71,6 +73,7 @@ impl PoolConfig {
             server_id,
             supported_extensions,
             required_extensions,
+            solo_mining_enabled,
         }
     }
 
@@ -148,6 +151,11 @@ impl PoolConfig {
     /// Returns the server id.
     pub fn server_id(&self) -> u16 {
         self.server_id
+    }
+
+    /// Returns whether solo mining mode is enabled.
+    pub fn solo_mining_enabled(&self) -> bool {
+        self.solo_mining_enabled
     }
 
     pub fn get_txout(&self) -> TxOut {
