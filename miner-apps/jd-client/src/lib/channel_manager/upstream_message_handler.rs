@@ -198,11 +198,24 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                     None
                 };
 
+                let full_extranonce_size = extended_channel.get_full_extranonce_size();
+
                 data.extranonce_prefix_factory_extended = extranonces.clone();
                 data.extranonce_prefix_factory_standard = extranonces;
                 data.upstream_channel = Some(extended_channel);
                 data.job_factory = Some(job_factory);
                 self.upstream_state.set(UpstreamState::Connected);
+
+                // set the full extranonce size for the group channel of all downstream clients
+                for (_downstream_id, downstream) in data.downstream.iter_mut() {
+                    downstream
+                        .downstream_data
+                        .super_safe_lock(|downstream_data| {
+                            downstream_data
+                                .group_channel
+                                .set_full_extranonce_size(full_extranonce_size);
+                        });
+                }
 
                 info!("Extended mining channel successfully initialized");
                 (

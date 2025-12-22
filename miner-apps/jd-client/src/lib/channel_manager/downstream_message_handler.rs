@@ -10,7 +10,6 @@ use stratum_apps::{
             server::{
                 error::{ExtendedChannelError, StandardChannelError},
                 extended::ExtendedChannel,
-                group::GroupChannel,
                 jobs::job_store::DefaultJobStore,
                 share_accounting::{ShareValidationError, ShareValidationResult},
                 standard::StandardChannel,
@@ -292,60 +291,13 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     downstream.downstream_data.super_safe_lock(|data| {
                         let mut messages: Vec<RouteMessageTo> = vec![];
 
-                        if !data.require_std_job && data.group_channels.is_none() {
-                            let group_channel_id =
-                                data.channel_id_factory.fetch_add(1, Ordering::Relaxed);
-                            let job_store = DefaultJobStore::new();
-                            let full_extranonce_size = channel_manager_data
-                                .upstream_channel
-                                .as_ref()
-                                .map(|channel| channel.get_full_extranonce_size())
-                                // This default only hits in solo-mining scenario
-                                .unwrap_or(FULL_EXTRANONCE_SIZE);
-
-                            let mut group_channel =
-                                match GroupChannel::new_for_job_declaration_client(
-                                    group_channel_id,
-                                    job_store,
-                                    full_extranonce_size,
-                                    channel_manager_data.pool_tag_string.clone(),
-                                    self.miner_tag_string.clone(),
-                                ) {
-                                    Ok(channel) => channel,
-                                    Err(e) => {
-                                        error!(?e, "Failed to create group channel");
-                                        return Err(JDCError::shutdown(e));
-                                    }
-                                };
-
-                            if let Err(e) = group_channel.on_new_template(
-                                last_future_template.clone(),
-                                coinbase_outputs.clone(),
-                            ) {
-                                error!(?e, "Failed to apply template to group channel");
-                                return Err(JDCError::shutdown(e));
-                            }
-
-                            if let Err(e) =
-                                group_channel.on_set_new_prev_hash(last_new_prev_hash.clone())
-                            {
-                                error!(?e, "Failed to apply prevhash to group channel");
-                                return Err(JDCError::shutdown(e));
-                            };
-
-                            data.group_channels = Some(group_channel);
-                        }
-
                         let nominal_hash_rate = msg.nominal_hash_rate;
                         let requested_max_target = Target::from_le_bytes(
                             msg.max_target.inner_as_ref().try_into().unwrap(),
                         );
 
-                        let group_channel_id = data
-                            .group_channels
-                            .as_ref()
-                            .map(|gc| gc.get_group_channel_id())
-                            .unwrap_or(0);
+                        let group_channel_id = data.group_channel.get_group_channel_id();
+
                         let standard_channel_id =
                             data.channel_id_factory.fetch_add(1, Ordering::Relaxed);
 
@@ -394,6 +346,8 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     };
                                 }
                             };
+
+                        let extranonce_prefix_size = standard_channel.get_extranonce_prefix().len();
 
                         let open_standard_mining_channel_success =
                             OpenStandardMiningChannelSuccess {
@@ -485,8 +439,13 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 (downstream_id, standard_channel_id, future_standard_job_id).into(),
                                 last_future_template.template_id,
                             );
-                        if let Some(group_channel) = data.group_channels.as_mut() {
-                            group_channel.add_standard_channel_id(standard_channel_id);
+                        if !data.require_std_job {
+                            data.group_channel
+                                .add_channel_id(standard_channel_id, extranonce_prefix_size)
+                                .map_err(|e| {
+                                    error!("Failed to add channel id to group channel: {:?}", e);
+                                    JDCError::shutdown(e)
+                                })?;
                         }
 
                         Ok(messages)
@@ -540,76 +499,105 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             })
         };
 
-        let messages =
-            self.channel_manager_data
-                .super_safe_lock(|channel_manager_data| {
+        let messages = self
+            .channel_manager_data
+            .super_safe_lock(|channel_manager_data| {
+                let Some(last_future_template) = channel_manager_data.last_future_template.clone()
+                else {
+                    error!("No template to share");
+                    return Err(JDCError::disconnect(
+                        JDCErrorKind::FutureTemplateNotPresent,
+                        downstream_id,
+                    ));
+                };
 
-                    let Some(last_future_template) = channel_manager_data.last_future_template.clone() else {
-                        error!("No template to share");
-                        return Err(JDCError::disconnect(JDCErrorKind::FutureTemplateNotPresent, downstream_id));
-                    };
+                let Some(last_new_prev_hash) = channel_manager_data.last_new_prev_hash.clone()
+                else {
+                    error!("No prevhash in system");
+                    return Err(JDCError::disconnect(
+                        JDCErrorKind::LastNewPrevhashNotFound,
+                        downstream_id,
+                    ));
+                };
 
-                    let Some(last_new_prev_hash) = channel_manager_data.last_new_prev_hash.clone() else {
-                        error!("No prevhash in system");
-                        return Err(JDCError::disconnect(JDCErrorKind::LastNewPrevhashNotFound, downstream_id));
-                    };
+                let Some(downstream) = channel_manager_data.downstream.get_mut(&downstream_id)
+                else {
+                    error!(downstream_id, "Downstream not found");
+                    return Err(JDCError::disconnect(
+                        JDCErrorKind::DownstreamNotFound(downstream_id),
+                        downstream_id,
+                    ));
+                };
 
-                    let Some(downstream) = channel_manager_data.downstream.get_mut(&downstream_id) else {
-                        error!(downstream_id, "Downstream not found");
-                        return Err(JDCError::disconnect(JDCErrorKind::DownstreamNotFound(downstream_id), downstream_id));
-                    };
-
-                   downstream.downstream_data.super_safe_lock(|data| {
-
+                downstream.downstream_data.super_safe_lock(|data| {
                         let mut messages: Vec<RouteMessageTo> = vec![];
-                        let extended_channel_id = data.channel_id_factory.fetch_add(1, Ordering::Relaxed);
+                        let extended_channel_id =
+                            data.channel_id_factory.fetch_add(1, Ordering::Relaxed);
 
-                        let extranonce_prefix = match channel_manager_data.extranonce_prefix_factory_extended
+                        let extranonce_prefix = match channel_manager_data
+                            .extranonce_prefix_factory_extended
                             .next_prefix_extended(requested_min_rollable_extranonce_size.into())
                         {
                             Ok(p) => p,
                             Err(e) => {
                                 error!(?e, "Extranonce prefix error");
-                                return Err(JDCError::shutdown(e));
+                                return Ok(vec![(
+                                    downstream_id,
+                                    build_error("min-extranonce-size-too-large"),
+                                )
+                                    .into()]);
                             }
                         };
-
 
                         let job_store = DefaultJobStore::new();
 
-                        let mut extended_channel = match ExtendedChannel::new_for_job_declaration_client(
-                            extended_channel_id,
-                            user_identity.to_string(),
-                            extranonce_prefix.into(),
-                            requested_max_target,
-                            nominal_hash_rate,
-                            true,
-                            requested_min_rollable_extranonce_size,
-                            self.share_batch_size,
-                            self.shares_per_minute,
-                            job_store,
-                            channel_manager_data.pool_tag_string.clone(),
-                            self.miner_tag_string.clone(),
-                        ) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                error!(?e, "Failed to create ExtendedChannel");
-                                return match e {
-                                    ExtendedChannelError::InvalidNominalHashrate => {
-                                        Ok(vec![(downstream_id, build_error("invalid-nominal-hashrate")).into()])
-                                    }
-                                    ExtendedChannelError::RequestedMaxTargetOutOfRange => {
-                                        Ok(vec![(downstream_id, build_error("max-target-out-of-range")).into()])
-                                    }
-                                    ExtendedChannelError::RequestedMinExtranonceSizeTooLarge  => {
-                                        Ok(vec![(downstream_id, build_error("min-extranonce-size-too-large")).into()])
-                                    }
-                                    other => Err(
-                                        JDCError::disconnect(other, downstream_id)
-                                    ),
+                        let full_extranonce_size = channel_manager_data
+                            .upstream_channel
+                            .as_ref()
+                            .map(|channel| channel.get_full_extranonce_size())
+                            .unwrap_or(FULL_EXTRANONCE_SIZE); // Default to FULL_EXTRANONCE_SIZE if
+                                                              // upstream channel is not present (solo mining mode)
+
+                        let rollable_extranonce_size =
+                            full_extranonce_size - extranonce_prefix.clone().to_vec().len();
+
+                        let mut extended_channel =
+                            match ExtendedChannel::new_for_job_declaration_client(
+                                extended_channel_id,
+                                user_identity.to_string(),
+                                extranonce_prefix.into(),
+                                requested_max_target,
+                                nominal_hash_rate,
+                                true,
+                                rollable_extranonce_size as u16,
+                                self.share_batch_size,
+                                self.shares_per_minute,
+                                job_store,
+                                channel_manager_data.pool_tag_string.clone(),
+                                self.miner_tag_string.clone(),
+                            ) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    error!(?e, "Failed to create ExtendedChannel");
+                                    return match e {
+                                        ExtendedChannelError::InvalidNominalHashrate => Ok(vec![(
+                                            downstream_id,
+                                            build_error("invalid-nominal-hashrate"),
+                                        )
+                                            .into()]),
+                                        ExtendedChannelError::RequestedMaxTargetOutOfRange => {
+                                            Ok(vec![(
+                                                downstream_id,
+                                                build_error("max-target-out-of-range"),
+                                            )
+                                                .into()])
+                                        }
+                                        other => Err(JDCError::disconnect(other, downstream_id)),
+                                    };
                                 }
-                            }
-                        };
+                            };
+
+                        let group_channel_id = data.group_channel.get_group_channel_id();
 
                         let open_extended_mining_channel_success =
                             OpenExtendedMiningChannelSuccess {
@@ -622,27 +610,38 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     .try_into()
                                     .expect("valid extranonce prefix"),
                                 extranonce_size: extended_channel.get_rollable_extranonce_size(),
+                                group_channel_id,
                             }
                             .into_static();
 
-                        messages.push((
-                            downstream_id,
-                            Mining::OpenExtendedMiningChannelSuccess(
-                                open_extended_mining_channel_success,
-                            ),
-                        ).into());
+                        let full_extranonce_size = extended_channel.get_full_extranonce_size();
 
-                        let mut coinbase_outputs = match deserialize_outputs(channel_manager_data.coinbase_outputs.clone()) {
+                        messages.push(
+                            (
+                                downstream_id,
+                                Mining::OpenExtendedMiningChannelSuccess(
+                                    open_extended_mining_channel_success,
+                                ),
+                            )
+                                .into(),
+                        );
+
+                        let mut coinbase_outputs = match deserialize_outputs(
+                            channel_manager_data.coinbase_outputs.clone(),
+                        ) {
                             Ok(outputs) => outputs,
-                            Err(_) => return Err(JDCError::shutdown(JDCErrorKind::ChannelManagerHasBadCoinbaseOutputs)),
+                            Err(_) => {
+                                return Err(JDCError::shutdown(
+                                    JDCErrorKind::ChannelManagerHasBadCoinbaseOutputs,
+                                ))
+                            }
                         };
                         coinbase_outputs[0].value =
                             Amount::from_sat(last_future_template.coinbase_tx_value_remaining);
 
-
                         // create a future extended job based on the last future template
-                        if let Err(e) =
-                            extended_channel.on_new_template(last_future_template.clone(), coinbase_outputs)
+                        if let Err(e) = extended_channel
+                            .on_new_template(last_future_template.clone(), coinbase_outputs)
                         {
                             error!(?e, "Failed to apply template to extended channel");
                             return Err(JDCError::shutdown(e));
@@ -660,12 +659,13 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
                         // send this future job as new job message
                         // to be immediately activated with the subsequent SetNewPrevHash message
-                        messages.push((
-                            downstream_id,
-                            Mining::NewExtendedMiningJob(
-                                future_extended_job_message,
-                            ),
-                        ).into());
+                        messages.push(
+                            (
+                                downstream_id,
+                                Mining::NewExtendedMiningJob(future_extended_job_message),
+                            )
+                                .into(),
+                        );
 
                         // SetNewPrevHash message activates the future job
                         let prev_hash = last_new_prev_hash.prev_hash.clone();
@@ -682,20 +682,38 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             error!(?e, "Failed to set prevhash on extended channel");
                             return Err(JDCError::shutdown(e));
                         }
-                        messages.push((
-                            downstream_id,
-                            Mining::SetNewPrevHash(set_new_prev_hash_mining),
-                        ).into());
+                        messages.push(
+                            (
+                                downstream_id,
+                                Mining::SetNewPrevHash(set_new_prev_hash_mining),
+                            )
+                                .into(),
+                        );
 
                         let vardiff = VardiffState::new().expect("Vardiff should instantiate.");
-                        data.extended_channels.insert(extended_channel_id, extended_channel);
+                        data.extended_channels
+                            .insert(extended_channel_id, extended_channel);
 
-                        channel_manager_data.downstream_channel_id_and_job_id_to_template_id.insert((downstream_id, extended_channel_id, future_extended_job_id).into(), last_future_template.template_id);
-                        channel_manager_data.vardiff.insert((downstream_id, extended_channel_id).into(), vardiff);
+                        channel_manager_data
+                            .downstream_channel_id_and_job_id_to_template_id
+                            .insert(
+                                (downstream_id, extended_channel_id, future_extended_job_id).into(),
+                                last_future_template.template_id,
+                            );
+                        channel_manager_data
+                            .vardiff
+                            .insert((downstream_id, extended_channel_id).into(), vardiff);
+
+                        data.group_channel
+                            .add_channel_id(extended_channel_id, full_extranonce_size)
+                            .map_err(|e| {
+                                error!("Failed to add channel id to group channel: {:?}", e);
+                                JDCError::shutdown(e)
+                            })?;
 
                         Ok(messages)
                     })
-                })?;
+            })?;
 
         for messages in messages {
             let _ = messages.forward(&self.channel_manager_channel).await;
@@ -1214,6 +1232,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             ShareValidationError::InvalidJobId => "invalid-job-id",
                             ShareValidationError::DoesNotMeetTarget => "difficulty-too-low",
                             ShareValidationError::DuplicateShare => "duplicate-share",
+                            ShareValidationError::BadExtranonceSize => "bad-extranonce-size",
                             _ => unreachable!(),
                         };
                         error!("❌ SubmitSharesError on downstream channel: ch={}, seq={}, error={code}", channel_id, msg.sequence_number);
@@ -1287,6 +1306,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     client::share_accounting::ShareValidationError::InvalidJobId=>"invalid-job-id",
                                     client::share_accounting::ShareValidationError::DoesNotMeetTarget=>"difficulty-too-low",
                                     client::share_accounting::ShareValidationError::DuplicateShare=>"duplicate-share",
+                                    client::share_accounting::ShareValidationError::BadExtranonceSize=>"bad-extranonce-size",
                                     _ => unreachable!(),
                                 };
                                 debug!("❌ SubmitSharesError not forwarding it to upstream: ch={}, seq={}, error={code}", channel_id, upstream_message.sequence_number);
