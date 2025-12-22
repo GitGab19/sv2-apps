@@ -46,7 +46,7 @@ mod extensions_message_handler;
 /// - Active [`StandardChannel`]s keyed by channel ID.
 pub struct DownstreamData {
     pub require_std_job: bool,
-    pub group_channels: Option<GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>>,
+    pub group_channel: GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
     pub extended_channels:
         HashMap<ChannelId, ExtendedChannel<'static, DefaultJobStore<ExtendedJob<'static>>>>,
     pub standard_channels:
@@ -87,9 +87,11 @@ pub struct Downstream {
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl Downstream {
     /// Creates a new [`Downstream`] instance and spawns the necessary I/O tasks.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     pub fn new(
         downstream_id: DownstreamId,
+        channel_id_factory: AtomicU32,
+        group_channel: GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
         channel_manager_sender: Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
         channel_manager_receiver: broadcast::Sender<(
             DownstreamId,
@@ -126,16 +128,18 @@ impl Downstream {
             downstream_sender: outbound_tx,
             downstream_receiver: inbound_rx,
         };
+
         let downstream_data = Arc::new(Mutex::new(DownstreamData {
             require_std_job: false,
             extended_channels: HashMap::new(),
             standard_channels: HashMap::new(),
-            group_channels: None,
-            channel_id_factory: AtomicU32::new(0),
+            group_channel,
+            channel_id_factory,
             negotiated_extensions: vec![],
             supported_extensions,
             required_extensions,
         }));
+
         Downstream {
             downstream_channel,
             downstream_data,
