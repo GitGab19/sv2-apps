@@ -3,6 +3,7 @@
 // `PoolSv2` is a module that implements the Pool role in the Stratum V2 protocol.
 use integration_tests_sv2::{
     interceptor::{MessageDirection, ReplaceMessage},
+    mock_roles::MockDownstream,
     template_provider::DifficultyLevel,
     *,
 };
@@ -413,5 +414,182 @@ async fn pool_reject_setup_connection_with_non_mining_protocol() {
         setup_connection_error.error_code.as_utf8_or_hex(),
         "unsupported-protocol",
         "SetupConnectionError message error code should be unsupported-protocol"
+    );
+}
+
+// This test launches a Pool and leverages a MockDownstream to test the correct functionalities of
+// grouping extended channels.
+#[tokio::test]
+async fn pool_group_extended_channels() {
+    start_tracing();
+    let sv2_interval = Some(5);
+    let (tp, tp_addr) = start_template_provider(sv2_interval, DifficultyLevel::Low);
+    tp.fund_wallet().unwrap();
+    let (_pool, pool_addr) = start_pool(sv2_tp_config(tp_addr), vec![], vec![]).await;
+
+    let (sniffer, sniffer_addr) = start_sniffer("sniffer", pool_addr, false, vec![], None);
+
+    let mock_downstream = MockDownstream::new(sniffer_addr);
+    let send_to_pool = mock_downstream.start().await;
+
+    // send SetupConnection message to the pool
+    let setup_connection = AnyMessage::Common(CommonMessages::SetupConnection(SetupConnection {
+        protocol: Protocol::MiningProtocol,
+        min_version: 2,
+        max_version: 2,
+        flags: 0,
+        endpoint_host: b"0.0.0.0".to_vec().try_into().unwrap(),
+        endpoint_port: 8081,
+        vendor: b"Bitmain".to_vec().try_into().unwrap(),
+        hardware_version: b"901".to_vec().try_into().unwrap(),
+        firmware: b"abcX".to_vec().try_into().unwrap(),
+        device_id: b"89567".to_vec().try_into().unwrap(),
+    }));
+    send_to_pool.send(setup_connection).await.unwrap();
+
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+
+    const NUM_EXTENDED_CHANNELS: u32 = 10;
+    const EXPECTED_GROUP_CHANNEL_ID: u32 = 1;
+
+    for i in 0..NUM_EXTENDED_CHANNELS {
+        // send OpenExtendedMiningChannel message to the pool
+        let open_extended_mining_channel = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
+            OpenExtendedMiningChannel {
+                request_id: i.into(),
+                user_identity: b"user_identity".to_vec().try_into().unwrap(),
+                nominal_hash_rate: 1000.0,
+                max_target: vec![0xff; 32].try_into().unwrap(),
+                min_extranonce_size: 0,
+            },
+        ));
+        send_to_pool
+            .send(open_extended_mining_channel)
+            .await
+            .unwrap();
+
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+            )
+            .await;
+
+        let group_channel_id = loop {
+            match sniffer.next_message_from_upstream() {
+                Some((_, AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(msg)))) => {
+                    break msg.group_channel_id;
+                }
+                _ => continue,
+            };
+        };
+
+        assert_eq!(
+            group_channel_id, EXPECTED_GROUP_CHANNEL_ID,
+            "Group channel ID should be correct"
+        );
+
+        // also assert the correct message sequence after OpenExtendedMiningChannelSuccess
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            )
+            .await;
+        sniffer
+            .wait_for_message_type_and_clean_queue(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+            )
+            .await;
+    }
+
+    // ok, up until this point, we were just initializing NUM_EXTENDED_CHANNELS extended channels
+    // now, let's see if a mempool change will trigger ONE (and not NUM_EXTENDED_CHANNELS)
+    // NewExtendedMiningJob message directed to the correct group channel ID
+
+    // create a mempool transaction to trigger a new template
+    tp.create_mempool_transaction().unwrap();
+
+    // wait for a NewExtendedMiningJob message
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+        )
+        .await;
+
+    // assert that the NewExtendedMiningJob message is directed to the correct group channel ID
+    let new_extended_mining_job_msg = sniffer.next_message_from_upstream();
+    let new_extended_mining_job_msg = match new_extended_mining_job_msg {
+        Some((_, AnyMessage::Mining(Mining::NewExtendedMiningJob(msg)))) => msg,
+        msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
+    };
+
+    assert_eq!(
+        new_extended_mining_job_msg.channel_id, EXPECTED_GROUP_CHANNEL_ID,
+        "NewExtendedMiningJob message should be directed to the correct group channel ID"
+    );
+
+    // wait a bit
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // make sure there's no extra NewExtendedMiningJob messages
+    assert!(
+        sniffer
+            .assert_message_not_present(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB
+            )
+            .await,
+        "There should be no extra NewExtendedMiningJob messages"
+    );
+
+    // now let's see if a chain tip update will trigger ONE (and not many) SetNewPrevHashMp message
+    // directed to the correct group channel ID
+
+    tp.generate_blocks(1);
+
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+        )
+        .await;
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+        )
+        .await;
+
+    let set_new_prev_hash_msg = sniffer.next_message_from_upstream();
+    let set_new_prev_hash_msg = match set_new_prev_hash_msg {
+        Some((_, AnyMessage::Mining(Mining::SetNewPrevHash(msg)))) => msg,
+        msg => panic!("Expected SetNewPrevHash message, found: {:?}", msg),
+    };
+
+    assert_eq!(
+        set_new_prev_hash_msg.channel_id, EXPECTED_GROUP_CHANNEL_ID,
+        "SetNewPrevHash message should be directed to the correct group channel ID"
+    );
+
+    // wait a bit
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // make sure there's no extra SetNewPrevHash messages
+    assert!(
+        sniffer
+            .assert_message_not_present(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_SET_NEW_PREV_HASH
+            )
+            .await,
+        "There should be no second SetNewPrevHash message"
     );
 }
