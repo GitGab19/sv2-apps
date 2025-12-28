@@ -1649,6 +1649,7 @@ dependencies = [
  "async-channel",
  "corepc-node",
  "flate2",
+ "hex",
  "jd_client_sv2",
  "jd_server",
  "mining_device",
