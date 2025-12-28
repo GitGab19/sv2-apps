@@ -247,16 +247,23 @@ async fn pool_does_not_send_jobs_to_jdc() {
         vec![],
         vec![],
     );
-    // Block NewExtendedMiningJob messages between JDC and translator proxy
+    // Block NewExtendedMiningJob and SetNewPrevHash messages between JDC and translator proxy
     let (_tproxy_jdc_sniffer, tproxy_jdc_sniffer_addr) = start_sniffer(
         "tproxy_jdc",
         jdc_addr,
         false,
-        vec![integration_tests_sv2::interceptor::IgnoreMessage::new(
-            MessageDirection::ToDownstream,
-            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
-        )
-        .into()],
+        vec![
+            integration_tests_sv2::interceptor::IgnoreMessage::new(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            )
+            .into(),
+            integration_tests_sv2::interceptor::IgnoreMessage::new(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+            )
+            .into(),
+        ],
         None,
     );
     let (_translator, tproxy_addr) =
