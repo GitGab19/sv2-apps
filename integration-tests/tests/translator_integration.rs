@@ -1,6 +1,6 @@
 // This file contains integration tests for the `TranslatorSv2` module.
 use integration_tests_sv2::{
-    interceptor::{MessageDirection, ReplaceMessage},
+    interceptor::{IgnoreMessage, MessageDirection, ReplaceMessage},
     template_provider::DifficultyLevel,
     *,
 };
@@ -16,6 +16,7 @@ use stratum_apps::stratum_core::{
         MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
     },
     parsers_sv2::{self, AnyMessage},
+    template_distribution_sv2::MESSAGE_TYPE_SUBMIT_SOLUTION,
 };
 
 // This test runs an sv2 translator between an sv1 mining device and a pool. the connection between
@@ -292,4 +293,246 @@ async fn test_translator_keepalive_job_sent_and_share_received_by_pool() {
             MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
         )
         .await;
+}
+
+// This test launches a tProxy in aggregated mode and leverages a MockUpstream to test the correct
+// functionalities of grouping extended channels.
+#[tokio::test]
+async fn aggregated_translator_correctly_deals_with_group_channels() {
+    start_tracing();
+    let (tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    tp.fund_wallet().unwrap();
+
+    // block SubmitSolution messages from arriving to TP
+    // so we avoid shares triggering chain tip updates
+    // which we want to do explicitly via generate_blocks()
+    let ignore_submit_solution =
+        IgnoreMessage::new(MessageDirection::ToUpstream, MESSAGE_TYPE_SUBMIT_SOLUTION);
+    let (_sniffer_pool_tp, sniffer_pool_tp_addr) = start_sniffer(
+        "0",
+        tp_addr,
+        false,
+        vec![ignore_submit_solution.into()],
+        None,
+    );
+
+    let (_pool, pool_addr) = start_pool(sv2_tp_config(sniffer_pool_tp_addr), vec![], vec![]).await;
+
+    // ignore SubmitSharesSuccess messages, so we can keep the assertion flow simple
+    let ignore_submit_shares_success = IgnoreMessage::new(
+        MessageDirection::ToDownstream,
+        MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+    );
+    let (sniffer, sniffer_addr) = start_sniffer(
+        "0",
+        pool_addr,
+        false,
+        vec![ignore_submit_shares_success.into()],
+        None,
+    );
+
+    // aggregated tProxy
+    let (_, tproxy_addr) = start_sv2_translator(&[sniffer_addr], true, vec![], vec![], None).await;
+
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+
+    let mut minerd_vec = Vec::new();
+
+    // start the first minerd process, to trigger the first OpenExtendedMiningChannel message
+    let (minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
+    minerd_vec.push(minerd_process);
+
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+        )
+        .await;
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+        )
+        .await;
+
+    // save the aggregated and group channel IDs
+    let (aggregated_channel_id, group_channel_id) = match sniffer.next_message_from_upstream() {
+        Some((
+            _,
+            AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(msg)),
+        )) => (msg.channel_id, msg.group_channel_id),
+        msg => panic!(
+            "Expected OpenExtendedMiningChannelSuccess message, found: {:?}",
+            msg
+        ),
+    };
+
+    // wait for the expected NewExtendedMiningJob and SetNewPrevHash messages
+    // and clean the queue
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+        )
+        .await;
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+        )
+        .await;
+
+    // open a few more extended channels to be aggregated with the first one
+    const N_MINERDS: u32 = 5;
+    for _i in 0..N_MINERDS {
+        let (minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
+        minerd_vec.push(minerd_process);
+
+        // wait a bit
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // assert no furter OpenExtendedMiningChannel messages are sent
+        sniffer
+            .assert_message_not_present(
+                MessageDirection::ToUpstream,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+            )
+            .await;
+    }
+
+    // wait for a SubmitSharesExtended message
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+        )
+        .await;
+
+    let share_channel_id = match sniffer.next_message_from_downstream() {
+        Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => {
+            msg.channel_id
+        }
+        msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
+    };
+
+    assert_eq!(
+        aggregated_channel_id, share_channel_id,
+        "Share submitted to the correct channel ID"
+    );
+    assert_ne!(
+        share_channel_id, group_channel_id,
+        "Share NOT submitted to the group channel ID"
+    );
+
+    // wait for another share, so we can clean the queue
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+        )
+        .await;
+
+    // now let's force a mempool update, so we trigger a NewExtendedMiningJob message
+    // it's actually directed to the group channel Id, not the aggregated channel Id
+    // nevertheless, tProxy should still submit the share to the aggregated channel Id
+    tp.create_mempool_transaction().unwrap();
+
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+        )
+        .await;
+    let new_extended_mining_job = match sniffer.next_message_from_upstream() {
+        Some((_, AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(msg)))) => msg,
+        msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
+    };
+
+    // here we're actually asserting pool behavior, not tProxy
+    // but still good to have, to ensure the global sanity of the test
+    assert_ne!(new_extended_mining_job.channel_id, aggregated_channel_id);
+    assert_eq!(new_extended_mining_job.channel_id, group_channel_id);
+
+    loop {
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToUpstream,
+                MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+            )
+            .await;
+        let submit_shares_extended = match sniffer.next_message_from_downstream() {
+            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
+        };
+
+        // assert the share is submitted to the aggregated channel Id
+        assert_eq!(submit_shares_extended.channel_id, aggregated_channel_id);
+        assert_ne!(submit_shares_extended.channel_id, group_channel_id);
+
+        if submit_shares_extended.job_id == 2 {
+            break;
+        }
+    }
+
+    // now let's force a chain tip update, so we trigger a SetNewPrevHash + NewExtendedMiningJob
+    // message pair
+    tp.generate_blocks(1);
+
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+        )
+        .await;
+    let new_extended_mining_job = match sniffer.next_message_from_upstream() {
+        Some((_, AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(msg)))) => msg,
+        msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
+    };
+
+    // again, asserting pool behavior, not tProxy
+    // just to ensure the global sanity of the test
+    assert_ne!(new_extended_mining_job.channel_id, aggregated_channel_id);
+    assert_eq!(new_extended_mining_job.channel_id, group_channel_id);
+
+    sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+        )
+        .await;
+    let set_new_prev_hash = match sniffer.next_message_from_upstream() {
+        Some((_, AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(msg)))) => msg,
+        msg => panic!("Expected SetNewPrevHash message, found: {:?}", msg),
+    };
+
+    // again, asserting pool behavior, not tProxy
+    // just to ensure the global sanity of the test
+    assert_eq!(set_new_prev_hash.channel_id, group_channel_id);
+    assert_ne!(set_new_prev_hash.channel_id, aggregated_channel_id);
+
+    loop {
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToUpstream,
+                MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+            )
+            .await;
+        let submit_shares_extended = match sniffer.next_message_from_downstream() {
+            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
+        };
+
+        // assert the share is submitted to the aggregated channel Id
+        assert_eq!(submit_shares_extended.channel_id, aggregated_channel_id);
+        assert_ne!(submit_shares_extended.channel_id, group_channel_id);
+
+        if submit_shares_extended.job_id == 3 {
+            break;
+        }
+    }
 }
