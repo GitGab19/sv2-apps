@@ -4,15 +4,17 @@ use integration_tests_sv2::{
     mock_roles::MockUpstream,
     sv1_sniffer::SV1MessageFilter,
     template_provider::DifficultyLevel,
+    utils::get_available_address,
     *,
 };
 use stratum_apps::stratum_core::mining_sv2::*;
 
 use std::collections::HashSet;
 use stratum_apps::stratum_core::{
+    binary_sv2::{Seq0255, Sv2Option},
     common_messages_sv2::{
-        SetupConnectionError, MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
-        MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        SetupConnectionError, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION,
+        MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
     },
     mining_sv2::{
         OpenMiningChannelError, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
@@ -837,6 +839,238 @@ async fn non_aggregated_translator_correctly_deals_with_group_channels() {
 
         channel_submitted_to.remove(&submit_shares_extended.channel_id);
         if channel_submitted_to.is_empty() {
+            break;
+        }
+    }
+}
+
+/// This test launches a tProxy in non-aggregated mode and leverages a MockUpstream to test the
+/// correct behavior of handling SetGroupChannel messages.
+///
+/// We first send a SetGroupChannel message to set a group channel ID A and B, and then we send a
+/// NewExtendedMiningJob + SetNewPrevHash message pair to group channel ID A.
+///
+/// We then assert that all channels in group channel ID A must submit at least one share with
+/// job_id = 2, and channels in group channel ID B must NOT submit any shares with job_id = 2.
+#[tokio::test]
+async fn non_aggregated_translator_handles_set_group_channel_message() {
+    start_tracing();
+
+    let mock_upstream_addr = get_available_address();
+    let mock_upstream = MockUpstream::new(mock_upstream_addr);
+    let send_to_tproxy = mock_upstream.start().await;
+
+    let (sniffer, sniffer_addr) = start_sniffer("", mock_upstream_addr, false, vec![], None);
+
+    let (_tproxy, tproxy_addr) =
+        start_sv2_translator(&[sniffer_addr], false, vec![], vec![], None).await;
+
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_SETUP_CONNECTION,
+        )
+        .await;
+
+    let setup_connection_success = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
+        SetupConnectionSuccess {
+            used_version: 2,
+            flags: 0,
+        },
+    ));
+    send_to_tproxy.send(setup_connection_success).await.unwrap();
+
+    const N_EXTENDED_CHANNELS: u32 = 6;
+    const GROUP_CHANNEL_ID_A: u32 = 100;
+    const GROUP_CHANNEL_ID_B: u32 = 200;
+
+    // we need to keep references to each minerd
+    // otherwise they would be dropped
+    let mut minerd_vec = Vec::new();
+
+    // spawn minerd processes to force opening N_EXTENDED_CHANNELS extended channels
+    for i in 0..N_EXTENDED_CHANNELS {
+        let (minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
+        minerd_vec.push(minerd_process);
+
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToUpstream,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+            )
+            .await;
+        let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+            match sniffer.next_message_from_downstream() {
+                Some((
+                    _,
+                    AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)),
+                )) => {
+                    break msg;
+                }
+                _ => continue,
+            };
+        };
+
+        let open_extended_mining_channel_success =
+            AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(
+                OpenExtendedMiningChannelSuccess {
+                    request_id: open_extended_mining_channel.request_id,
+                    channel_id: i,
+                    target: hex::decode(
+                        "0000137c578190689425e3ecf8449a1af39db0aed305d9206f45ac32fe8330fc",
+                    )
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                    // full extranonce has a total of 8 bytes
+                    extranonce_size: 4,
+                    extranonce_prefix: vec![0x00, 0x01, 0x00, i as u8].try_into().unwrap(),
+                    group_channel_id: GROUP_CHANNEL_ID_A,
+                },
+            ));
+        send_to_tproxy
+            .send(open_extended_mining_channel_success)
+            .await
+            .unwrap();
+
+        sniffer
+            .wait_for_message_type_and_clean_queue(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+            )
+            .await;
+
+        let new_extended_mining_job = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(NewExtendedMiningJob {
+            channel_id: i,
+            job_id: 1,
+            min_ntime: Sv2Option::new(None),
+            version: 0x20000000,
+            version_rolling_allowed: true,
+            merkle_path: Seq0255::new(vec![]).unwrap(),
+            // scriptSig for a total of 8 bytes of extranonce
+            coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff225200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap().try_into().unwrap(),
+            coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000").unwrap().try_into().unwrap(),
+        }));
+
+        send_to_tproxy.send(new_extended_mining_job).await.unwrap();
+        sniffer
+            .wait_for_message_type_and_clean_queue(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            )
+            .await;
+
+        let set_new_prev_hash =
+            AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+                channel_id: i,
+                job_id: 1,
+                prev_hash: hex::decode(
+                    "3ab7089cd2cd30f133552cfde82c4cb239cd3c2310306f9d825e088a1772cc39",
+                )
+                .unwrap()
+                .try_into()
+                .unwrap(),
+                min_ntime: 1766782170,
+                nbits: 0x207fffff,
+            }));
+
+        send_to_tproxy.send(set_new_prev_hash).await.unwrap();
+        sniffer
+            .wait_for_message_type_and_clean_queue(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+            )
+            .await;
+    }
+
+    // half of the channels belong to GROUP_CHANNEL_ID_A
+    let group_channel_a_ids = (0..N_EXTENDED_CHANNELS)
+        .filter(|i| i % 2 != 0)
+        .collect::<Vec<_>>();
+
+    // half of the channels belong to GROUP_CHANNEL_ID_B
+    let group_channel_b_ids = (0..N_EXTENDED_CHANNELS)
+        .filter(|i| i % 2 == 0)
+        .collect::<Vec<_>>();
+
+    // send a SetGroupChannel message to set GROUP_CHANNEL_ID_B
+    let set_group_channel =
+        AnyMessage::Mining(parsers_sv2::Mining::SetGroupChannel(SetGroupChannel {
+            channel_ids: group_channel_b_ids.clone().into(),
+            group_channel_id: GROUP_CHANNEL_ID_B,
+        }));
+    send_to_tproxy.send(set_group_channel).await.unwrap();
+
+    // send a NewExtendedMiningJob + SetNewPrevHash message pair ONLY to GROUP_CHANNEL_ID_B
+    let new_extended_mining_job = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(NewExtendedMiningJob {
+        channel_id: GROUP_CHANNEL_ID_B,
+        job_id: 2,
+        min_ntime: Sv2Option::new(None),
+        version: 0x20000000,
+        version_rolling_allowed: true,
+        merkle_path: Seq0255::new(vec![]).unwrap(),
+        // scriptSig for a total of 8 bytes of extranonce
+        coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff225300162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap().try_into().unwrap(),
+        coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000").unwrap().try_into().unwrap(),
+    }));
+
+    send_to_tproxy.send(new_extended_mining_job).await.unwrap();
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+        )
+        .await;
+
+    let set_new_prev_hash =
+        AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+            channel_id: GROUP_CHANNEL_ID_B,
+            job_id: 2,
+            prev_hash: hex::decode(
+                "2089973501ad229333ae0e9c52fa160f95616890db364a71ccfb77773a8b54cb",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+            min_ntime: 1766782171,
+            nbits: 0x207fffff,
+        }));
+    send_to_tproxy.send(set_new_prev_hash).await.unwrap();
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+        )
+        .await;
+
+    // all channels in GROUP_CHANNEL_ID_B must submit at least one share with job_id = 2
+    // channels in GROUP_CHANNEL_ID_A must NOT submit any shares with job_id = 2
+    let mut channels_submitted_to: HashSet<u32> = group_channel_b_ids.clone().into_iter().collect();
+    loop {
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToUpstream,
+                MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+            )
+            .await;
+        let submit_shares_extended = match sniffer.next_message_from_downstream() {
+            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
+        };
+
+        if submit_shares_extended.job_id != 2 {
+            continue;
+        }
+
+        if group_channel_a_ids.contains(&submit_shares_extended.channel_id) {
+            panic!(
+                "Channel {} should not have submitted a share with job_id = 2",
+                submit_shares_extended.channel_id
+            );
+        }
+
+        channels_submitted_to.remove(&submit_shares_extended.channel_id);
+        if channels_submitted_to.is_empty() {
             break;
         }
     }

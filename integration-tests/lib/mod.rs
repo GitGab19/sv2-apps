@@ -37,7 +37,7 @@ pub mod sv1_minerd;
 pub mod sv1_sniffer;
 pub mod template_provider;
 pub mod types;
-pub(crate) mod utils;
+pub mod utils;
 
 const SHARES_PER_MINUTE: f32 = 120.0;
 
