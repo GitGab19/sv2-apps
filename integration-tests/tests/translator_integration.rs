@@ -8,7 +8,7 @@ use integration_tests_sv2::{
 };
 use stratum_apps::stratum_core::mining_sv2::*;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use stratum_apps::stratum_core::{
     binary_sv2::{Seq0255, Sv2Option},
     common_messages_sv2::{
@@ -16,7 +16,8 @@ use stratum_apps::stratum_core::{
         MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
     },
     mining_sv2::{
-        OpenMiningChannelError, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+        CloseChannel, OpenMiningChannelError, MESSAGE_TYPE_CLOSE_CHANNEL,
+        MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
         MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
     },
     parsers_sv2::{self, AnyMessage, CommonMessages},
@@ -1020,4 +1021,245 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
             break;
         }
     }
+}
+
+/// This test launches a tProxy in non-aggregated mode and leverages a MockUpstream to test the
+/// correct behavior of handling CloseChannel messages.
+///
+/// First we close a single channel, and assert that no shares are submitted from it.
+/// Then we close the group channel, and assert that no shares are submitted from any channel.
+#[tokio::test]
+async fn non_aggregated_translator_correctly_deals_with_close_channel_message() {
+    start_tracing();
+
+    let mock_upstream_addr = get_available_address();
+    let mock_upstream = MockUpstream::new(mock_upstream_addr);
+    let send_to_tproxy = mock_upstream.start().await;
+
+    let (sniffer, sniffer_addr) = start_sniffer("", mock_upstream_addr, false, vec![], None);
+
+    let (_tproxy, tproxy_addr) =
+        start_sv2_translator(&[sniffer_addr], false, vec![], vec![], None).await;
+
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_SETUP_CONNECTION,
+        )
+        .await;
+
+    let setup_connection_success = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
+        SetupConnectionSuccess {
+            used_version: 2,
+            flags: 0,
+        },
+    ));
+    send_to_tproxy.send(setup_connection_success).await.unwrap();
+
+    const N_EXTENDED_CHANNELS: u32 = 3;
+    const GROUP_CHANNEL_ID: u32 = 100;
+
+    // we need to keep references to each minerd
+    // otherwise they would be dropped
+    let mut minerd_vec = Vec::new();
+
+    // spawn minerd processes to force opening N_EXTENDED_CHANNELS extended channels
+    for i in 0..N_EXTENDED_CHANNELS {
+        let (minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
+        minerd_vec.push(minerd_process);
+
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToUpstream,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+            )
+            .await;
+        let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+            match sniffer.next_message_from_downstream() {
+                Some((
+                    _,
+                    AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)),
+                )) => {
+                    break msg;
+                }
+                _ => continue,
+            };
+        };
+
+        let open_extended_mining_channel_success =
+            AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(
+                OpenExtendedMiningChannelSuccess {
+                    request_id: open_extended_mining_channel.request_id,
+                    channel_id: i,
+                    target: hex::decode(
+                        "0000137c578190689425e3ecf8449a1af39db0aed305d9206f45ac32fe8330fc",
+                    )
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                    // full extranonce has a total of 8 bytes
+                    extranonce_size: 4,
+                    extranonce_prefix: vec![0x00, 0x01, 0x00, i as u8].try_into().unwrap(),
+                    group_channel_id: GROUP_CHANNEL_ID,
+                },
+            ));
+        send_to_tproxy
+            .send(open_extended_mining_channel_success)
+            .await
+            .unwrap();
+
+        sniffer
+            .wait_for_message_type_and_clean_queue(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+            )
+            .await;
+
+        let new_extended_mining_job = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(NewExtendedMiningJob {
+            channel_id: i,
+            job_id: 1,
+            min_ntime: Sv2Option::new(None),
+            version: 0x20000000,
+            version_rolling_allowed: true,
+            merkle_path: Seq0255::new(vec![]).unwrap(),
+            // scriptSig for a total of 8 bytes of extranonce
+            coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff225200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap().try_into().unwrap(),
+            coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000").unwrap().try_into().unwrap(),
+        }));
+
+        send_to_tproxy.send(new_extended_mining_job).await.unwrap();
+        sniffer
+            .wait_for_message_type_and_clean_queue(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            )
+            .await;
+
+        let set_new_prev_hash =
+            AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+                channel_id: i,
+                job_id: 1,
+                prev_hash: hex::decode(
+                    "3ab7089cd2cd30f133552cfde82c4cb239cd3c2310306f9d825e088a1772cc39",
+                )
+                .unwrap()
+                .try_into()
+                .unwrap(),
+                min_ntime: 1766782170,
+                nbits: 0x207fffff,
+            }));
+
+        send_to_tproxy.send(set_new_prev_hash).await.unwrap();
+        sniffer
+            .wait_for_message_type_and_clean_queue(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+            )
+            .await;
+    }
+
+    // let's wait until all channels send at least one share
+    let mut channels_submitted_to: HashSet<u32> = (0..N_EXTENDED_CHANNELS).into_iter().collect();
+    loop {
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToUpstream,
+                MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+            )
+            .await;
+        let submit_shares_extended = match sniffer.next_message_from_downstream() {
+            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
+        };
+
+        channels_submitted_to.remove(&submit_shares_extended.channel_id);
+        if channels_submitted_to.is_empty() {
+            break;
+        }
+    }
+
+    // let's close one of the channels
+    const CLOSED_CHANNEL_ID: u32 = 0;
+    let close_channel = AnyMessage::Mining(parsers_sv2::Mining::CloseChannel(CloseChannel {
+        channel_id: CLOSED_CHANNEL_ID,
+        reason_code: "".to_string().try_into().unwrap(),
+    }));
+    send_to_tproxy.send(close_channel).await.unwrap();
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_CLOSE_CHANNEL,
+        )
+        .await;
+
+    // Drain all pending messages from the sniffer queue
+    while sniffer.next_message_from_downstream().is_some() {
+        // Keep draining until queue is empty
+    }
+
+    // Small delay to let any in-flight messages arrive
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // let's wait until all open channels send at least 5 shares
+    // if the closed channel sends a share, the test fails
+    let mut share_submission_count = HashMap::new();
+    loop {
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToUpstream,
+                MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+            )
+            .await;
+        let submit_shares_extended = match sniffer.next_message_from_downstream() {
+            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
+        };
+
+        if submit_shares_extended.channel_id == CLOSED_CHANNEL_ID {
+            panic!("Closed channel should not have submitted a share");
+        }
+
+        // update the share submission count for the channel
+        if let Some(count) = share_submission_count.get_mut(&submit_shares_extended.channel_id) {
+            *count += 1;
+        } else {
+            share_submission_count.insert(submit_shares_extended.channel_id, 1);
+        }
+
+        // have all open channels submitted shares?
+        if share_submission_count.len() == (N_EXTENDED_CHANNELS - 1) as usize {
+            // check if all open channels submitted at least 5 shares
+            let all_open_channels_have_enough_shares =
+                share_submission_count.values().all(|count| *count >= 5);
+
+            if all_open_channels_have_enough_shares {
+                // all open channels submitted at least 5 shares
+                break;
+            }
+        }
+    }
+
+    // now let's send a CloseChannel for the group channel
+    let close_channel = AnyMessage::Mining(parsers_sv2::Mining::CloseChannel(CloseChannel {
+        channel_id: GROUP_CHANNEL_ID,
+        reason_code: "".to_string().try_into().unwrap(),
+    }));
+    send_to_tproxy.send(close_channel).await.unwrap();
+    sniffer
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_CLOSE_CHANNEL,
+        )
+        .await;
+
+    // wait enough time for any channels to submit some share (which they shouldn't)
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // no shares should arrive after the group channel is closed
+    sniffer
+        .assert_message_not_present(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+        )
+        .await;
 }
