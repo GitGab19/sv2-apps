@@ -26,7 +26,9 @@ pub struct Sv1ServerData {
     pub downstreams: HashMap<DownstreamId, Arc<Downstream>>,
     pub request_id_to_downstream_id: HashMap<RequestId, DownstreamId>,
     pub vardiff: HashMap<DownstreamId, Arc<RwLock<VardiffState>>>,
-    pub prevhash: Option<SetNewPrevHash<'static>>,
+    /// HashMap to store the SetNewPrevHash for each channel
+    /// Used in both aggregated and non-aggregated mode
+    pub prevhashes: HashMap<ChannelId, SetNewPrevHash<'static>>,
     pub downstream_id_factory: AtomicUsize,
     pub request_id_factory: AtomicU32,
     /// Job storage for aggregated mode - all Sv1 downstreams share the same jobs
@@ -52,7 +54,7 @@ impl Sv1ServerData {
             downstreams: HashMap::new(),
             request_id_to_downstream_id: HashMap::new(),
             vardiff: HashMap::new(),
-            prevhash: None,
+            prevhashes: HashMap::new(),
             downstream_id_factory: AtomicUsize::new(1),
             request_id_factory: AtomicU32::new(1),
             aggregated_valid_jobs: aggregate_channels.then(Vec::new),
@@ -85,6 +87,16 @@ impl Sv1ServerData {
     #[inline]
     pub fn is_keepalive_job_id(job_id: &str) -> bool {
         job_id.contains(KEEPALIVE_JOB_ID_DELIMITER)
+    }
+
+    /// Gets the prevhash for a given channel.
+    pub fn get_prevhash(&self, channel_id: u32) -> Option<SetNewPrevHash<'static>> {
+        self.prevhashes.get(&channel_id).cloned()
+    }
+
+    /// Sets the prevhash for a given channel.
+    pub fn set_prevhash(&mut self, channel_id: u32, prevhash: SetNewPrevHash<'static>) {
+        self.prevhashes.insert(channel_id, prevhash);
     }
 
     /// Gets the last job from the jobs storage.

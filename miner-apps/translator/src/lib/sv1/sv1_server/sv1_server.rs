@@ -576,7 +576,9 @@ impl Sv1Server {
                     "Received NewExtendedMiningJob for channel id: {}",
                     m.channel_id
                 );
-                if let Some(prevhash) = self.sv1_server_data.super_safe_lock(|v| v.prevhash.clone())
+                if let Some(prevhash) = self
+                    .sv1_server_data
+                    .super_safe_lock(|v| v.get_prevhash(m.channel_id))
                 {
                     let clean_jobs = m.job_id == prevhash.job_id;
                     let notify =
@@ -616,7 +618,7 @@ impl Sv1Server {
             Mining::SetNewPrevHash(m) => {
                 debug!("Received SetNewPrevHash for channel id: {}", m.channel_id);
                 self.sv1_server_data
-                    .super_safe_lock(|v| v.prevhash = Some(m.clone().into_static()));
+                    .super_safe_lock(|v| v.set_prevhash(m.channel_id, m.clone().into_static()));
             }
 
             Mining::SetTarget(m) => {
