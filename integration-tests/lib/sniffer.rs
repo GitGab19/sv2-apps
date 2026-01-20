@@ -95,10 +95,12 @@ impl<'a> Sniffer<'a> {
                 match TcpStream::connect(upstream_address).await {
                     Ok(stream) => break stream,
                     Err(_) => {
-                        println!(
-                            "Sniffer {}: unable to connect to upstream {}, retrying",
-                            identifier, upstream_address
+                        tracing::warn!(
+                            "Sniffer {}: unable to connect to upstream {}, retrying after 1 second",
+                            identifier,
+                            upstream_address
                         );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     }
                 }
             })

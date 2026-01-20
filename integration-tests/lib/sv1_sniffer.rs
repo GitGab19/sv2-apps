@@ -59,6 +59,10 @@ impl SnifferSV1 {
                 match TcpStream::connect(upstream_address).await {
                     Ok(s) => break s,
                     Err(_) => {
+                        tracing::warn!(
+                            "SnifferSV1: unable to connect to upstream, retrying after 1 second"
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         continue;
                     }
                 }
