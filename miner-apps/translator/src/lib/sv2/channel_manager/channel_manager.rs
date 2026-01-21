@@ -5,7 +5,7 @@ use crate::{
         channel::ChannelState,
         data::{ChannelManagerData, ChannelMode},
     },
-    utils::ShutdownMessage,
+    utils::{ShutdownMessage, AGGREGATED_CHANNEL_ID},
 };
 use async_channel::{Receiver, Sender};
 use std::sync::{Arc, RwLock};
@@ -392,18 +392,23 @@ impl ChannelManager {
                                             }
                                         });
                                     }
-                                    job.channel_id = next_channel_id;
-                                    // update the downstream channel with the active job
+                                    // Update the downstream channel state with the active job
+                                    // (using next_channel_id for correct channel id tracking)
+                                    let mut job_for_channel = job.clone();
+                                    job_for_channel.channel_id = next_channel_id;
                                     self.channel_manager_data.super_safe_lock(|c| {
                                         if let Some(ch) = c.extended_channels.get(&next_channel_id)
                                         {
                                             let _ = ch
                                                 .write()
                                                 .unwrap()
-                                                .on_new_extended_mining_job(job.clone());
+                                                .on_new_extended_mining_job(job_for_channel);
                                         }
                                     });
 
+                                    // Send the job to Sv1Server with AGGREGATED_CHANNEL_ID so it
+                                    // can find the prevhash
+                                    job.channel_id = AGGREGATED_CHANNEL_ID;
                                     self.channel_state
                                         .sv1_server_sender
                                         .send((Mining::NewExtendedMiningJob(job.clone()), None))
