@@ -1794,3 +1794,172 @@ async fn aggregated_translator_handles_downstream_connecting_during_future_job()
         .wait_for_message(&["mining.submit"], MessageDirection::ToUpstream)
         .await;
 }
+
+/// Verifies that SetExtranoncePrefix triggers fallback since Sv1 clients cannot handle
+/// dynamic extranonce changes. Ignoring this message would cause share validity issues.
+#[tokio::test]
+async fn translator_fallbacks_on_set_extranonce_prefix() {
+    start_tracing();
+
+    // First upstream server mock (will send SetExtranoncePrefix)
+    let mock_upstream_addr_a = get_available_address();
+    let mock_upstream_a = MockUpstream::new(mock_upstream_addr_a);
+    let send_to_tproxy_a = mock_upstream_a.start().await;
+    let (sniffer_a, sniffer_addr_a) = start_sniffer("A", mock_upstream_addr_a, false, vec![], None);
+
+    // Second upstream server mock (fallback target)
+    let mock_upstream_addr_b = get_available_address();
+    let mock_upstream_b = MockUpstream::new(mock_upstream_addr_b);
+    let _send_to_tproxy_b = mock_upstream_b.start().await;
+    let (sniffer_b, sniffer_addr_b) = start_sniffer("B", mock_upstream_addr_b, false, vec![], None);
+
+    let (_tproxy, tproxy_addr) = start_sv2_translator(
+        &[sniffer_addr_a, sniffer_addr_b],
+        true,
+        vec![],
+        vec![],
+        None,
+    )
+    .await;
+
+    sniffer_a
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_SETUP_CONNECTION,
+        )
+        .await;
+
+    // Send SetupConnectionSuccess
+    let setup_connection_success = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
+        SetupConnectionSuccess {
+            used_version: 2,
+            flags: 0,
+        },
+    ));
+    send_to_tproxy_a
+        .send(setup_connection_success)
+        .await
+        .unwrap();
+
+    // Start a minerd to trigger OpenExtendedMiningChannel
+    let mut minerd_vec = Vec::new();
+    let (minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
+    minerd_vec.push(minerd_process);
+
+    sniffer_a
+        .wait_for_message_type(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+        )
+        .await;
+
+    let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+        match sniffer_a.next_message_from_downstream() {
+            Some((_, AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)))) => {
+                break msg;
+            }
+            _ => continue,
+        };
+    };
+
+    // Send OpenExtendedMiningChannelSuccess with initial extranonce prefix
+    let initial_extranonce_prefix = vec![0x00, 0x01, 0x02, 0x03];
+    let open_extended_mining_channel_success = AnyMessage::Mining(
+        parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
+            request_id: open_extended_mining_channel.request_id,
+            channel_id: 0,
+            target: hex::decode("0000137c578190689425e3ecf8449a1af39db0aed305d9206f45ac32fe8330fc")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            extranonce_size: 8,
+            extranonce_prefix: initial_extranonce_prefix.clone().try_into().unwrap(),
+            group_channel_id: 100,
+        }),
+    );
+    send_to_tproxy_a
+        .send(open_extended_mining_channel_success)
+        .await
+        .unwrap();
+
+    sniffer_a
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+        )
+        .await;
+
+    // Send NewExtendedMiningJob
+    let new_extended_mining_job = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(
+        NewExtendedMiningJob {
+            channel_id: 0,
+            job_id: 1,
+            min_ntime: Sv2Option::new(None),
+            version: 0x20000000,
+            version_rolling_allowed: true,
+            merkle_path: Seq0255::new(vec![]).unwrap(),
+            coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff265200162f5374726174756d2056322053524920506f6f6c2f2f0c").unwrap().try_into().unwrap(),
+            coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000").unwrap().try_into().unwrap(),
+        },
+    ));
+    send_to_tproxy_a
+        .send(new_extended_mining_job)
+        .await
+        .unwrap();
+
+    sniffer_a
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+        )
+        .await;
+
+    // Send SetNewPrevHash to activate the job
+    let set_new_prev_hash =
+        AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+            channel_id: 0,
+            job_id: 1,
+            prev_hash: hex::decode(
+                "3ab7089cd2cd30f133552cfde82c4cb239cd3c2310306f9d825e088a1772cc39",
+            )
+            .unwrap()
+            .try_into()
+            .unwrap(),
+            min_ntime: 1766782170,
+            nbits: 0x207fffff,
+        }));
+    send_to_tproxy_a.send(set_new_prev_hash).await.unwrap();
+
+    sniffer_a
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+        )
+        .await;
+
+    // Wait for at least one share submission to ensure the channel is fully operational
+    sniffer_a
+        .wait_for_message_type_and_clean_queue(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+        )
+        .await;
+
+    // Now send SetExtranoncePrefix with a NEW prefix - this should trigger fallback!
+    // The new prefix is different from the initial one established in
+    // OpenExtendedMiningChannelSuccess
+    let new_extranonce_prefix = vec![0xAA, 0xBB, 0xCC, 0xDD];
+    let set_extranonce_prefix = AnyMessage::Mining(parsers_sv2::Mining::SetExtranoncePrefix(
+        SetExtranoncePrefix {
+            channel_id: 0,
+            extranonce_prefix: new_extranonce_prefix.try_into().unwrap(),
+        },
+    ));
+    send_to_tproxy_a.send(set_extranonce_prefix).await.unwrap();
+
+    // The translator should trigger fallback and connect to the second upstream
+    // Verify by waiting for SetupConnection on sniffer_b
+    sniffer_b
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+}
