@@ -347,8 +347,13 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         warn!("Received: {}", m);
-        warn!("⚠️ Cannot process SetExtranoncePrefix since set_extranonce is not supported for majority of sv1 clients. Ignoring.");
-        Ok(())
+        error!(
+            "⚠️ Cannot process SetExtranoncePrefix: Sv1 clients do not support dynamic \
+            extranonce1 changes. Triggering fallback."
+        );
+        Err(TproxyError::fallback(
+            TproxyErrorKind::ExtranoncePrefixChanged,
+        ))
     }
 
     async fn handle_submit_shares_success(

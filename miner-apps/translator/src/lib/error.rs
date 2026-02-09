@@ -202,6 +202,8 @@ pub enum TproxyErrorKind {
     FailedToAddChannelIdToGroupChannel(GroupChannelError),
     /// Aggregated channel was closed
     AggregatedChannelClosed,
+    /// Extranonce prefix changed after channel was created
+    ExtranoncePrefixChanged,
 }
 
 impl std::error::Error for TproxyErrorKind {}
@@ -278,6 +280,10 @@ impl fmt::Display for TproxyErrorKind {
                 write!(f, "Failed to add channel id to group channel: {e:?}")
             }
             AggregatedChannelClosed => write!(f, "Aggregated channel was closed"),
+            ExtranoncePrefixChanged => write!(
+                f,
+                "Extranonce prefix changed after channel was created - Sv1 clients cannot handle dynamic extranonce changes"
+            ),
         }
     }
 }
