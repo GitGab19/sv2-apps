@@ -12,12 +12,15 @@ use stratum_apps::{
     custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
     stratum_core::{
-        channels_sv2::client::{extended::ExtendedChannel, group::GroupChannel},
+        channels_sv2::{
+            client::{extended::ExtendedChannel, group::GroupChannel},
+            extranonce_manager::ExtranonceAllocator,
+        },
         codec_sv2::StandardSv2Frame,
         extensions_sv2::{EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY},
         framing_sv2,
         handlers_sv2::{HandleExtensionsFromServerAsync, HandleMiningMessagesFromServerAsync},
-        mining_sv2::{ExtendedExtranonce, OpenExtendedMiningChannelSuccess},
+        mining_sv2::OpenExtendedMiningChannelSuccess,
         parsers_sv2::{AnyMessage, Mining, Tlv, TlvList},
     },
     task_manager::TaskManager,
@@ -30,10 +33,12 @@ use stratum_apps::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Extra bytes allocated for translator search space in aggregated mode.
-/// This allows the translator to manage multiple downstream connections
-/// by allocating unique extranonce prefixes to each downstream.
-const AGGREGATED_MODE_TRANSLATOR_SEARCH_SPACE_BYTES: usize = 4;
+/// Number of bytes the translator uses for its local extranonce prefix allocation
+/// in aggregated mode (unique prefix per downstream).
+pub const TPROXY_ALLOCATION_BYTES: usize = 4;
+
+/// Maximum number of downstream channels the translator can allocate prefixes for.
+pub const TPROXY_MAX_CHANNELS: usize = 65_536;
 
 /// Manages SV2 channels and message routing between upstream and downstream.
 ///
@@ -73,8 +78,10 @@ pub struct ChannelManager {
     pub share_sequence_counters: Arc<DashMap<u32, u32>>,
     /// Extensions that have been successfully negotiated with the upstream server
     pub negotiated_extensions: Arc<Mutex<Vec<u16>>>,
-    /// Extranonce factories containing per channel extranonces
-    pub extranonce_factories: Arc<DashMap<ChannelId, ExtendedExtranonce>>,
+    /// Extranonce allocators containing per channel extranonce management
+    pub extranonce_allocators: Arc<DashMap<ChannelId, ExtranonceAllocator>>,
+    /// Mapping of channel_id → local_prefix_id for freeing extranonces on channel close
+    pub channel_to_local_prefix_id: Arc<DashMap<ChannelId, usize>>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -121,7 +128,8 @@ impl ChannelManager {
             group_channels: Arc::new(DashMap::new()),
             share_sequence_counters: Arc::new(DashMap::new()),
             negotiated_extensions: Arc::new(Mutex::new(Vec::new())),
-            extranonce_factories: Arc::new(DashMap::new()),
+            extranonce_allocators: Arc::new(DashMap::new()),
+            channel_to_local_prefix_id: Arc::new(DashMap::new()),
         }
     }
 
@@ -172,7 +180,8 @@ impl ChannelManager {
                         self.group_channels.clear();
                         self.share_sequence_counters.clear();
                         self.negotiated_extensions.super_safe_lock(|data| data.clear());
-                        self.extranonce_factories.clear();
+                        self.extranonce_allocators.clear();
+                        self.channel_to_local_prefix_id.clear();
                         break;
                     }
                     res = self.clone().handle_upstream_frame() => {
@@ -301,18 +310,22 @@ impl ChannelManager {
                             .get(&AGGREGATED_CHANNEL_ID)
                             .map(|ch| *ch.get_target())
                             .unwrap();
-                        let new_extranonce_prefix = self
-                            .extranonce_factories
+                        let alloc_result = self
+                            .extranonce_allocators
                             .get_mut(&AGGREGATED_CHANNEL_ID)
-                            .unwrap()
-                            .next_prefix_extended(open_channel_msg.min_extranonce_size.into())
-                            .ok();
+                            .and_then(|mut allocator| {
+                                allocator
+                                    .allocate_extended(open_channel_msg.min_extranonce_size.into())
+                                    .ok()
+                            });
                         let new_extranonce_size = self
-                            .extranonce_factories
-                            .get_mut(&AGGREGATED_CHANNEL_ID)
-                            .unwrap()
-                            .get_range2_len();
-                        if let Some(new_extranonce_prefix) = new_extranonce_prefix {
+                            .extranonce_allocators
+                            .get(&AGGREGATED_CHANNEL_ID)
+                            .map(|allocator| allocator.rollable_extranonce_size())
+                            .unwrap_or(0);
+                        if let Some(prefix) = alloc_result {
+                            let new_extranonce_prefix = prefix.as_bytes().to_vec();
+                            let local_prefix_id = prefix.local_prefix_id();
                             if new_extranonce_size >= open_channel_msg.min_extranonce_size as usize
                             {
                                 // Find max channel ID, excluding AGGREGATED_CHANNEL_ID (u32::MAX)
@@ -323,14 +336,12 @@ impl ChannelManager {
                                     .filter(|x| *x.key() != AGGREGATED_CHANNEL_ID)
                                     .fold(0, |acc, x| std::cmp::max(acc, *x.key()));
                                 let next_channel_id = channel_id + 1;
+                                self.channel_to_local_prefix_id
+                                    .insert(next_channel_id, local_prefix_id);
                                 let new_downstream_extended_channel = ExtendedChannel::new(
                                     next_channel_id,
                                     user_identity.clone(),
-                                    new_extranonce_prefix
-                                        .clone()
-                                        .into_b032()
-                                        .into_static()
-                                        .to_vec(),
+                                    new_extranonce_prefix.clone(),
                                     target,
                                     hashrate,
                                     true,
@@ -344,7 +355,10 @@ impl ChannelManager {
                                         channel_id: next_channel_id,
                                         target: target.to_le_bytes().into(),
                                         extranonce_size: new_extranonce_size as u16,
-                                        extranonce_prefix: new_extranonce_prefix.clone().into(),
+                                        extranonce_prefix: new_extranonce_prefix
+                                            .clone()
+                                            .try_into()
+                                            .expect("valid prefix"),
                                         group_channel_id: 0, /* use a dummy value, this shouldn't
                                                               * matter for the Sv1 server */
                                     },
@@ -445,9 +459,9 @@ impl ChannelManager {
                             user_identity.as_bytes().to_vec().try_into().unwrap();
                     }
                 }
-                // In aggregated mode, add extra bytes for translator search space allocation
+                // In aggregated mode, add extra bytes for translator's own prefix allocation
                 let upstream_min_extranonce_size = if is_aggregated() {
-                    min_extranonce_size + AGGREGATED_MODE_TRANSLATOR_SEARCH_SPACE_BYTES
+                    min_extranonce_size + TPROXY_ALLOCATION_BYTES
                 } else {
                     min_extranonce_size
                 };
@@ -513,16 +527,17 @@ impl ChannelManager {
                             .extended_channels
                             .get(&m.channel_id)
                             .map(|channel| channel.get_extranonce_prefix().clone());
-                        // Get the length of the upstream prefix (range0)
-                        let range0_len = self
-                            .extranonce_factories
+                        // Get the length of the upstream prefix
+                        let upstream_prefix_len = self
+                            .extranonce_allocators
                             .get(&AGGREGATED_CHANNEL_ID)
-                            .unwrap()
-                            .get_range0_len();
+                            .map(|allocator| allocator.upstream_prefix_len())
+                            .unwrap_or(0);
                         if let Some(downstream_extranonce_prefix) = downstream_extranonce_prefix {
-                            // Skip the upstream prefix (range0) and take the remaining
+                            // Skip the upstream prefix and take the remaining
                             // bytes (translator proxy prefix)
-                            let translator_prefix = &downstream_extranonce_prefix[range0_len..];
+                            let translator_prefix =
+                                &downstream_extranonce_prefix[upstream_prefix_len..];
                             // Create new extranonce: translator proxy prefix + miner's
                             // extranonce
                             let mut new_extranonce = translator_prefix.to_vec();
@@ -540,21 +555,22 @@ impl ChannelManager {
                         // counter
                         m.sequence_number = self.next_share_sequence_number(m.channel_id);
 
-                        // Check if we have a per-channel factory for extranonce adjustment
-                        let channel_factory = self.extranonce_factories.get(&m.channel_id);
+                        // Check if we have a per-channel allocator for extranonce adjustment
+                        let channel_allocator = self.extranonce_allocators.get(&m.channel_id);
 
-                        if let Some(factory) = channel_factory {
+                        if let Some(allocator) = channel_allocator {
                             // We need to adjust the extranonce for this channel
                             let downstream_extranonce_prefix = self
                                 .extended_channels
                                 .get(&m.channel_id)
                                 .map(|channel| channel.get_extranonce_prefix().clone());
-                            let range0_len = factory.get_range0_len();
+                            let upstream_prefix_len = allocator.upstream_prefix_len();
                             if let Some(downstream_extranonce_prefix) = downstream_extranonce_prefix
                             {
-                                // Skip the upstream prefix (range0) and take the remaining
+                                // Skip the upstream prefix and take the remaining
                                 // bytes (translator proxy prefix)
-                                let translator_prefix = &downstream_extranonce_prefix[range0_len..];
+                                let translator_prefix =
+                                    &downstream_extranonce_prefix[upstream_prefix_len..];
                                 // Create new extranonce: translator proxy prefix + miner's
                                 // extranonce
                                 let mut new_extranonce = translator_prefix.to_vec();
@@ -691,20 +707,40 @@ impl ChannelManager {
                         debug!("Removed channel {} from group channel before sending CloseChannel to upstream", m.channel_id);
                     }
                 }
+                // Free the extranonce prefix for reuse
+                if let Some((_, prefix_id)) = self.channel_to_local_prefix_id.remove(&m.channel_id)
+                {
+                    // In aggregated mode, free from AGGREGATED_CHANNEL_ID allocator
+                    if is_aggregated() {
+                        if let Some(mut allocator) =
+                            self.extranonce_allocators.get_mut(&AGGREGATED_CHANNEL_ID)
+                        {
+                            allocator.free(prefix_id);
+                        }
+                    } else if let Some(mut allocator) =
+                        self.extranonce_allocators.get_mut(&m.channel_id)
+                    {
+                        allocator.free(prefix_id);
+                    }
+                }
 
-                let message = Mining::CloseChannel(m);
-                let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
-                    .try_into()
-                    .map_err(TproxyError::shutdown)?;
+                // In aggregated mode, don't forward CloseChannel to upstream since all
+                // downstreams share the same upstream channel (AGGREGATED_CHANNEL_ID)
+                if !is_aggregated() {
+                    let message = Mining::CloseChannel(m);
+                    let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
+                        .try_into()
+                        .map_err(TproxyError::shutdown)?;
 
-                self.channel_state
-                    .upstream_sender
-                    .send(sv2_frame)
-                    .await
-                    .map_err(|e| {
-                        error!("Failed to send CloseChannel message to upstream: {:?}", e);
-                        TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
-                    })?;
+                    self.channel_state
+                        .upstream_sender
+                        .send(sv2_frame)
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to send CloseChannel message to upstream: {:?}", e);
+                            TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
+                        })?;
+                }
             }
             _ => {
                 warn!("Unhandled downstream message: {:?}", message);

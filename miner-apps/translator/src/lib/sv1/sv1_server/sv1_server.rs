@@ -799,22 +799,22 @@ impl Sv1Server {
 
             let channel_id = downstream.downstream_data.super_safe_lock(|d| d.channel_id);
             if let Some(channel_id) = channel_id {
-                if !self.config.aggregate_channels {
-                    info!("Sending CloseChannel message: {channel_id} for downstream: {downstream_id}");
-                    let reason_code =
-                        Str0255::try_from("downstream disconnected".to_string()).unwrap();
-                    _ = self
-                        .sv1_server_channel_state
-                        .channel_manager_sender
-                        .send((
-                            Mining::CloseChannel(CloseChannel {
-                                channel_id,
-                                reason_code,
-                            }),
-                            None,
-                        ))
-                        .await;
-                }
+                // Always send CloseChannel to ChannelManager so it can free the extranonce
+                // prefix. In aggregated mode, ChannelManager will free the prefix but won't
+                // forward CloseChannel to upstream.
+                info!("Sending CloseChannel message: {channel_id} for downstream: {downstream_id}");
+                let reason_code = Str0255::try_from("downstream disconnected".to_string()).unwrap();
+                _ = self
+                    .sv1_server_channel_state
+                    .channel_manager_sender
+                    .send((
+                        Mining::CloseChannel(CloseChannel {
+                            channel_id,
+                            reason_code,
+                        }),
+                        None,
+                    ))
+                    .await;
             }
         }
     }
