@@ -16,7 +16,8 @@ keywords = ["stratum", "mining", "bitcoin", "protocol", "sv2"]
 # fetching from github enables synchronizing development workflows across sv2-apps and stratum repos
 # it MUST be changed before stratum-apps is published to crates.io
 # with the proper version of stratum-core being fetched from crates.io as well
-stratum-core = { git = "https://github.com/stratum-mining/stratum", branch = "main", optional = true }
+# TODO: points this to https://github.com/stratum-mining/stratum once https://github.com/stratum-mining/stratum/pull/2098 is merged
+stratum-core = { git = "https://github.com/GitGab19/stratum", branch = "extranonce-allocation", optional = true }
 
 # External dependencies needed by the modules
 # Network helpers dependencies
