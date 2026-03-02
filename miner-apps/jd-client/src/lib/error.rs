@@ -22,6 +22,7 @@ use stratum_apps::{
         binary_sv2, bitcoin,
         channels_sv2::{
             client::error::ExtendedChannelError as ExtendedChannelClientError,
+            extranonce_manager::ExtranonceAllocatorError,
             server::error::{
                 ExtendedChannelError as ExtendedChannelServerError, GroupChannelError,
                 StandardChannelError,
@@ -29,7 +30,6 @@ use stratum_apps::{
         },
         framing_sv2,
         handlers_sv2::HandlerErrorType,
-        mining_sv2::ExtendedExtranonceError,
         noise_sv2,
         parsers_sv2::ParserError,
     },
@@ -138,7 +138,7 @@ where
 pub enum ChannelSv2Error {
     ExtendedChannelClientSide(ExtendedChannelClientError),
     ExtendedChannelServerSide(ExtendedChannelServerError),
-    ExtranonceError(ExtendedExtranonceError),
+    ExtranonceError(ExtranonceAllocatorError),
     StandardChannelServerSide(StandardChannelError),
     GroupChannelServerSide(GroupChannelError),
 }
@@ -214,8 +214,10 @@ pub enum JDCErrorKind {
     FailedToCreateGroupChannel(GroupChannelError),
     ///Channel Errors
     ChannelSv2(ChannelSv2Error),
-    /// Extranonce prefix error
-    ExtranoncePrefixFactoryError(ExtendedExtranonceError),
+    /// Extranonce allocator error
+    ExtranonceAllocatorError(ExtranonceAllocatorError),
+    /// Extranonce allocator not initialized
+    ExtranonceAllocatorNotInitialized,
     /// Invalid unsupported extensions sequence (exceeds maximum length)
     InvalidUnsupportedExtensionsSequence,
     /// Invalid required extensions sequence (exceeds maximum length)
@@ -338,8 +340,8 @@ impl fmt::Display for JDCErrorKind {
             FailedToCreateGroupChannel(ref e) => {
                 write!(f, "Failed to create group channel: {e:?}")
             }
-            ExtranoncePrefixFactoryError(e) => {
-                write!(f, "Failed to create ExtranoncePrefixFactory: {e:?}")
+            ExtranonceAllocatorError(e) => {
+                write!(f, "Extranonce allocator error: {e:?}")
             }
             ChannelSv2(channel_error) => {
                 write!(f, "Channel error: {channel_error:?}")
@@ -396,6 +398,9 @@ impl fmt::Display for JDCErrorKind {
             CustomJobError => write!(f, "Custom job not acknowledged"),
             CouldNotInitiateSystem => write!(f, "Could not initiate subsystem"),
             InvalidKey => write!(f, "Invalid key used during noise handshake"),
+            ExtranonceAllocatorNotInitialized => {
+                write!(f, "Extranonce allocator not initialized")
+            }
         }
     }
 }
@@ -494,8 +499,8 @@ impl From<StandardChannelError> for JDCErrorKind {
     }
 }
 
-impl From<ExtendedExtranonceError> for JDCErrorKind {
-    fn from(value: ExtendedExtranonceError) -> Self {
+impl From<ExtranonceAllocatorError> for JDCErrorKind {
+    fn from(value: ExtranonceAllocatorError) -> Self {
         JDCErrorKind::ChannelSv2(ChannelSv2Error::ExtranonceError(value))
     }
 }

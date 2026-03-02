@@ -205,6 +205,15 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 channel_manager_data
                     .vardiff
                     .remove(&(downstream_id, msg.channel_id).into());
+
+                if let Some(prefix_id) = channel_manager_data
+                    .channel_to_local_prefix_id
+                    .remove(&(downstream_id, msg.channel_id))
+                {
+                    if let Some(ref mut allocator) = channel_manager_data.extranonce_allocator {
+                        allocator.free(prefix_id);
+                    }
+                }
                 Ok(())
             })
     }
@@ -301,23 +310,31 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         let standard_channel_id =
                             data.channel_id_factory.fetch_add(1, Ordering::Relaxed);
 
-                        let extranonce_prefix = match channel_manager_data
-                            .extranonce_prefix_factory_standard
-                            .next_prefix_standard()
-                        {
+                        let allocator = channel_manager_data
+                            .extranonce_allocator
+                            .as_mut()
+                            .ok_or_else(|| {
+                                JDCError::shutdown(JDCErrorKind::ExtranonceAllocatorNotInitialized)
+                            })?;
+                        let prefix = match allocator.allocate_standard() {
                             Ok(p) => p,
                             Err(e) => {
                                 error!(?e, "Failed to get extranonce prefix");
                                 return Err(JDCError::shutdown(e));
                             }
                         };
+                        let extranonce_prefix = prefix.as_bytes().to_vec();
+                        channel_manager_data.channel_to_local_prefix_id.insert(
+                            (downstream_id, standard_channel_id),
+                            prefix.local_prefix_id(),
+                        );
 
                         let job_store = DefaultJobStore::new();
                         let mut standard_channel =
                             match StandardChannel::new_for_job_declaration_client(
                                 standard_channel_id,
                                 user_identity.to_string(),
-                                extranonce_prefix.to_vec(),
+                                extranonce_prefix,
                                 requested_max_target,
                                 nominal_hash_rate,
                                 self.share_batch_size,
@@ -534,9 +551,14 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         let extended_channel_id =
                             data.channel_id_factory.fetch_add(1, Ordering::Relaxed);
 
-                        let extranonce_prefix = match channel_manager_data
-                            .extranonce_prefix_factory_extended
-                            .next_prefix_extended(requested_min_rollable_extranonce_size.into())
+                        let allocator = channel_manager_data
+                            .extranonce_allocator
+                            .as_mut()
+                            .ok_or_else(|| {
+                                JDCError::shutdown(JDCErrorKind::ExtranonceAllocatorNotInitialized)
+                            })?;
+                        let prefix = match allocator
+                            .allocate_extended(requested_min_rollable_extranonce_size.into())
                         {
                             Ok(p) => p,
                             Err(e) => {
@@ -548,6 +570,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     .into()]);
                             }
                         };
+                        let extranonce_prefix = prefix.as_bytes().to_vec();
+                        channel_manager_data.channel_to_local_prefix_id.insert(
+                            (downstream_id, extended_channel_id),
+                            prefix.local_prefix_id(),
+                        );
 
                         let job_store = DefaultJobStore::new();
 
@@ -559,13 +586,13 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                                               // upstream channel is not present (solo mining mode)
 
                         let rollable_extranonce_size =
-                            full_extranonce_size - extranonce_prefix.clone().to_vec().len();
+                            full_extranonce_size - extranonce_prefix.len();
 
                         let mut extended_channel =
                             match ExtendedChannel::new_for_job_declaration_client(
                                 extended_channel_id,
                                 user_identity.to_string(),
-                                extranonce_prefix.into(),
+                                extranonce_prefix,
                                 requested_max_target,
                                 nominal_hash_rate,
                                 true,
