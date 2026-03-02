@@ -99,6 +99,13 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 channel_manager_data
                     .vardiff
                     .remove(&(downstream_id, msg.channel_id).into());
+
+                if let Some(prefix_id) = channel_manager_data
+                    .channel_to_local_prefix_id
+                    .remove(&(downstream_id, msg.channel_id))
+                {
+                    channel_manager_data.extranonce_allocator.free(prefix_id);
+                }
                 Ok(())
             })
     }
@@ -150,12 +157,15 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             downstream.downstream_data.super_safe_lock(|downstream_data| {
                 let nominal_hash_rate = msg.nominal_hash_rate;
                 let requested_max_target = Target::from_le_bytes(msg.max_target.inner_as_ref().try_into().unwrap());
-                let extranonce_prefix = channel_manager_data.extranonce_prefix_factory_standard.next_prefix_standard().map_err(PoolError::shutdown)?;
+                let prefix = channel_manager_data.extranonce_allocator.allocate_standard().map_err(PoolError::shutdown)?;
+                let extranonce_prefix = prefix.as_bytes().to_vec();
+                let local_prefix_id = prefix.local_prefix_id();
 
                 let channel_id = downstream_data.channel_id_factory.fetch_add(1, Ordering::SeqCst);
+                channel_manager_data.channel_to_local_prefix_id.insert((downstream_id, channel_id), local_prefix_id);
                 let job_store = DefaultJobStore::new();
 
-                let mut standard_channel = match StandardChannel::new_for_pool(channel_id, user_identity.to_string(), extranonce_prefix.to_vec(), requested_max_target, nominal_hash_rate, self.share_batch_size, self.shares_per_minute, job_store, self.pool_tag_string.clone()) {
+                let mut standard_channel = match StandardChannel::new_for_pool(channel_id, user_identity.to_string(), extranonce_prefix, requested_max_target, nominal_hash_rate, self.share_batch_size, self.shares_per_minute, job_store, self.pool_tag_string.clone()) {
                     Ok(channel) => channel,
                     Err(e) => match e {
                         StandardChannelError::InvalidNominalHashrate => {
@@ -282,11 +292,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     .super_safe_lock(|downstream_data| {
                         let mut messages: Vec<RouteMessageTo> = Vec::new();
 
-                        let extranonce_prefix = match channel_manager_data
-                            .extranonce_prefix_factory_extended
-                            .next_prefix_extended(requested_min_rollable_extranonce_size.into())
+                        let (extranonce_prefix, local_prefix_id) = match channel_manager_data
+                            .extranonce_allocator
+                            .allocate_extended(requested_min_rollable_extranonce_size.into())
                         {
-                            Ok(extranonce_prefix) => extranonce_prefix.to_vec(),
+                            Ok(prefix) => (prefix.as_bytes().to_vec(), prefix.local_prefix_id()),
                             Err(_) => {
                                 error!("OpenMiningChannelError: min-extranonce-size-too-large");
                                 let open_extended_mining_channel_error = OpenMiningChannelError {
@@ -309,6 +319,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         let channel_id = downstream_data
                             .channel_id_factory
                             .fetch_add(1, Ordering::SeqCst);
+                        channel_manager_data.channel_to_local_prefix_id.insert((downstream_id, channel_id), local_prefix_id);
                         let job_store = DefaultJobStore::new();
 
                         let mut extended_channel = match ExtendedChannel::new_for_pool(

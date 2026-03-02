@@ -19,6 +19,7 @@ use stratum_apps::{
     stratum_core::{
         bitcoin::{Amount, TxOut},
         channels_sv2::{
+            extranonce_manager::ExtranonceAllocator,
             server::{
                 extended::ExtendedChannel,
                 group::GroupChannel,
@@ -30,7 +31,7 @@ use stratum_apps::{
         handlers_sv2::{
             HandleMiningMessagesFromClientAsync, HandleTemplateDistributionMessagesFromServerAsync,
         },
-        mining_sv2::{ExtendedExtranonce, SetTarget},
+        mining_sv2::SetTarget,
         parsers_sv2::{Mining, TemplateDistribution, Tlv},
         template_distribution_sv2::{NewTemplate, SetNewPrevHash},
     },
@@ -58,12 +59,11 @@ pub struct ChannelManagerData {
     // Mapping of `downstream_id` → `Downstream` object,
     // used by the channel manager to locate and interact with downstream clients.
     pub(crate) downstream: HashMap<DownstreamId, Downstream>,
-    // Extranonce prefix factory for **extended downstream channels**.
-    // Each new extended downstream receives a unique extranonce prefix.
-    extranonce_prefix_factory_extended: ExtendedExtranonce,
-    // Extranonce prefix factory for **standard downstream channels**.
-    // Each new standard downstream receives a unique extranonce prefix.
-    extranonce_prefix_factory_standard: ExtendedExtranonce,
+    // Extranonce allocator for both standard and extended downstream channels.
+    // Each new downstream channel receives a unique extranonce prefix.
+    pub(crate) extranonce_allocator: ExtranonceAllocator,
+    // Mapping of `(downstream_id, channel_id)` → `local_prefix_id` for freeing extranonces.
+    pub(crate) channel_to_local_prefix_id: HashMap<(DownstreamId, ChannelId), usize>,
     // Factory that assigns a unique ID to each new **downstream connection**.
     downstream_id_factory: AtomicUsize,
     // Mapping of `(downstream_id, channel_id)` → vardiff controller.
@@ -114,32 +114,22 @@ impl ChannelManager {
         downstream_receiver: Receiver<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
         coinbase_outputs: Vec<u8>,
     ) -> PoolResult<Self, error::ChannelManager> {
-        let range_0 = 0..0;
-        let range_1 = 0..POOL_ALLOCATION_BYTES;
-        let range_2 = POOL_ALLOCATION_BYTES..POOL_ALLOCATION_BYTES + CLIENT_SEARCH_SPACE_BYTES;
+        // Server ID is used to distinguish multiple pool server instances.
+        // It takes 2 bytes of the local_prefix, leaving 2 bytes for channel IDs (65,536 channels).
+        let server_id = config.server_id().to_be_bytes().to_vec();
 
-        let make_extranonce_factory = || {
-            // simulating a scenario where there are multiple mining servers
-            // this static prefix allows unique extranonce_prefix allocation
-            // for this mining server
-            let static_prefix = config.server_id().to_be_bytes().to_vec();
-
-            ExtendedExtranonce::new(
-                range_0.clone(),
-                range_1.clone(),
-                range_2.clone(),
-                Some(static_prefix),
-            )
-            .expect("Failed to create ExtendedExtranonce with valid ranges")
-        };
-
-        let extranonce_prefix_factory_extended = make_extranonce_factory();
-        let extranonce_prefix_factory_standard = make_extranonce_factory();
+        let extranonce_allocator = ExtranonceAllocator::new(
+            FULL_EXTRANONCE_SIZE,  // 20 bytes total extranonce
+            POOL_ALLOCATION_BYTES, // 4 bytes for local prefix (2 server_id + 2 channel id)
+            Some(server_id),       // 2-byte server identifier
+            65_536,                // max concurrent channels (2^16, fits in 2 bytes)
+        )
+        .expect("Failed to create ExtranonceAllocator with valid configuration");
 
         let channel_manager_data = Arc::new(Mutex::new(ChannelManagerData {
             downstream: HashMap::new(),
-            extranonce_prefix_factory_extended,
-            extranonce_prefix_factory_standard,
+            extranonce_allocator,
+            channel_to_local_prefix_id: HashMap::new(),
             downstream_id_factory: AtomicUsize::new(1),
             vardiff: HashMap::new(),
             coinbase_outputs,
@@ -430,6 +420,19 @@ impl ChannelManager {
             cm_data
                 .vardiff
                 .retain(|key, _| key.downstream_id != downstream_id);
+            // Free extranonce prefixes for all channels belonging to this downstream
+            let prefix_ids_to_free: Vec<usize> = cm_data
+                .channel_to_local_prefix_id
+                .iter()
+                .filter(|((ds_id, _), _)| *ds_id == downstream_id)
+                .map(|(_, prefix_id)| *prefix_id)
+                .collect();
+            for prefix_id in prefix_ids_to_free {
+                cm_data.extranonce_allocator.free(prefix_id);
+            }
+            cm_data
+                .channel_to_local_prefix_id
+                .retain(|(ds_id, _), _| *ds_id != downstream_id);
         });
         Ok(())
     }

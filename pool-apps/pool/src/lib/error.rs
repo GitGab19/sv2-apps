@@ -9,6 +9,7 @@ use stratum_apps::{
     stratum_core::{
         binary_sv2, bitcoin,
         channels_sv2::{
+            extranonce_manager::ExtranonceAllocatorError,
             server::{
                 error::{ExtendedChannelError, GroupChannelError, StandardChannelError},
                 share_accounting::ShareValidationError,
@@ -17,7 +18,6 @@ use stratum_apps::{
         },
         codec_sv2, framing_sv2,
         handlers_sv2::HandlerErrorType,
-        mining_sv2::ExtendedExtranonceError,
         noise_sv2,
         parsers_sv2::{Mining, ParserError},
     },
@@ -105,7 +105,7 @@ pub enum ChannelSv2Error {
     ExtendedChannelServerSide(ExtendedChannelError),
     StandardChannelServerSide(StandardChannelError),
     GroupChannelServerSide(GroupChannelError),
-    ExtranonceError(ExtendedExtranonceError),
+    ExtranonceError(ExtranonceAllocatorError),
     ShareValidationError(ShareValidationError),
 }
 
@@ -374,8 +374,8 @@ impl From<GroupChannelError> for PoolErrorKind {
     }
 }
 
-impl From<ExtendedExtranonceError> for PoolErrorKind {
-    fn from(value: ExtendedExtranonceError) -> Self {
+impl From<ExtranonceAllocatorError> for PoolErrorKind {
+    fn from(value: ExtranonceAllocatorError) -> Self {
         PoolErrorKind::ChannelSv2(ChannelSv2Error::ExtranonceError(value))
     }
 }
