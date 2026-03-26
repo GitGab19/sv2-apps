@@ -28,6 +28,17 @@ pub enum BitcoinCoreSv2TDPError {
     FailedToCreateSolutionDir,
 }
 
+impl BitcoinCoreSv2TDPError {
+    /// Returns true when the error indicates transient IPC contention in Bitcoin Core.
+    pub fn is_thread_busy(&self) -> bool {
+        matches!(
+            self,
+            BitcoinCoreSv2TDPError::CapnpError(capnp_error)
+                if capnp_error.to_string().contains("thread busy")
+        )
+    }
+}
+
 impl From<capnp::Error> for BitcoinCoreSv2TDPError {
     fn from(error: capnp::Error) -> Self {
         BitcoinCoreSv2TDPError::CapnpError(error)

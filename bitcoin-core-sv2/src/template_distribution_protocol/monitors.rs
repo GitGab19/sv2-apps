@@ -253,8 +253,16 @@ impl BitcoinCoreSv2TDP {
                                 }
                             }
                             Err(e) => {
-                                tracing::debug!("waitNext request failed with error: {}", e);
-                                tracing::error!("Failed to get response: {}", e);
+                                let err: super::error::BitcoinCoreSv2TDPError = e.into();
+                                if err.is_thread_busy() {
+                                    tracing::warn!(
+                                        error = ?err,
+                                        "Transient IPC contention during waitNext (thread busy); retrying"
+                                    );
+                                    continue;
+                                }
+                                tracing::debug!("waitNext request failed with error: {:?}", err);
+                                tracing::error!("Failed to get response: {:?}", err);
                                 tracing::warn!("Terminating Sv2 Bitcoin Core IPC Connection");
                                 self_clone.global_cancellation_token.cancel();
                                 break;
