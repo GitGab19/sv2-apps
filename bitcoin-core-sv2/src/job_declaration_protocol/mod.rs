@@ -265,42 +265,81 @@ impl BitcoinCoreSv2JDP {
     /// `waitNext` monitor has not yet advanced `current_template_ipc_client`.
     ///
     /// It differs from update_mempool_mirror in the sense that it doesn't assume a new template is
-    /// available. It forces the template refresh before updating MempoolMirror
+    /// available. It forces the template refresh before updating MempoolMirror.
+    ///
+    /// On transient `"thread busy"` IPC contention, this method retries a few times with
+    /// a short backoff before returning the error.
     pub(crate) async fn force_update_mempool_mirror(&self) -> Result<(), BitcoinCoreSv2JDPError> {
-        let mut create_new_block_request = self.mining_ipc_client.create_new_block_request();
+        const MAX_ATTEMPTS: usize = 3;
+        const RETRY_BACKOFF_MS: u64 = 25;
 
-        let mut create_new_block_options =
-            create_new_block_request.get().get_options().map_err(|e| {
-                tracing::error!("Failed to get createNewBlock options: {e}");
-                e
-            })?;
+        let mut last_error: Option<BitcoinCoreSv2JDPError> = None;
 
-        create_new_block_options.set_use_mempool(true);
+        for attempt in 1..=MAX_ATTEMPTS {
+            let result = async {
+                let mut create_new_block_request =
+                    self.mining_ipc_client.create_new_block_request();
 
-        let create_new_block_response =
-            create_new_block_request.send().promise.await.map_err(|e| {
-                tracing::error!("Failed to send createNewBlock request: {e}");
-                e
-            })?;
+                let mut create_new_block_options =
+                    create_new_block_request.get().get_options().map_err(|e| {
+                        tracing::error!("Failed to get createNewBlock options: {e}");
+                        e
+                    })?;
 
-        let new_template_ipc_client = create_new_block_response
-            .get()
-            .map_err(|e| {
-                tracing::error!("Failed to read createNewBlock response: {e}");
-                e
-            })?
-            .get_result()
-            .map_err(|e| {
-                tracing::error!("Failed to get BlockTemplate from createNewBlock: {e}");
-                e
-            })?;
+                create_new_block_options.set_use_mempool(true);
 
-        {
-            let mut current_template_ipc_client = self.current_template_ipc_client.borrow_mut();
-            *current_template_ipc_client = new_template_ipc_client;
+                let create_new_block_response =
+                    create_new_block_request.send().promise.await.map_err(|e| {
+                        tracing::error!("Failed to send createNewBlock request: {e}");
+                        e
+                    })?;
+
+                let new_template_ipc_client = create_new_block_response
+                    .get()
+                    .map_err(|e| {
+                        tracing::error!("Failed to read createNewBlock response: {e}");
+                        e
+                    })?
+                    .get_result()
+                    .map_err(|e| {
+                        tracing::error!("Failed to get BlockTemplate from createNewBlock: {e}");
+                        e
+                    })?;
+
+                {
+                    let mut current_template_ipc_client =
+                        self.current_template_ipc_client.borrow_mut();
+                    *current_template_ipc_client = new_template_ipc_client;
+                }
+
+                self.update_mempool_mirror().await
+            }
+            .await;
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is_thread_busy() && attempt < MAX_ATTEMPTS => {
+                    tracing::warn!(
+                        error = ?e,
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        "Transient IPC contention during force_update_mempool_mirror (thread busy); retrying"
+                    );
+                    last_error = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_BACKOFF_MS)).await;
+                }
+                Err(e) => return Err(e),
+            }
         }
 
-        self.update_mempool_mirror().await
+        // ideally the retry logic should never allow execution to reach here
+        // but if it does, we just bubble up the error
+        Err(last_error.unwrap_or_else(|| {
+            BitcoinCoreSv2JDPError::CapnpError(capnp::Error::failed(
+                "force_update_mempool_mirror exhausted retries without a terminal error"
+                    .to_string(),
+            ))
+        }))
     }
 
     /// Processes a single job declaration request and dispatches to the appropriate handler.

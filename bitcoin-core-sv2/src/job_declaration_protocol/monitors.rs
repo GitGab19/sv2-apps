@@ -101,6 +101,14 @@ impl BitcoinCoreSv2JDP {
 
                                 // update the mempool mirror
                                 if let Err(e) = self_clone.update_mempool_mirror().await {
+                                    if e.is_thread_busy() {
+                                        tracing::warn!(
+                                            error = ?e,
+                                            "Transient IPC contention while updating mempool mirror (thread busy); retrying"
+                                        );
+                                        continue;
+                                    }
+
                                     tracing::error!("Failed to update mempool mirror: {:?}", e);
                                     self_clone.cancellation_token.cancel();
                                     break;
