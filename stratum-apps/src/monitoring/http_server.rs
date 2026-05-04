@@ -80,7 +80,7 @@ use utoipa_swagger_ui::SwaggerUi;
         (name = "sv1", description = "Sv1 clients monitoring (Translator Proxy only)")
     )
 )]
-struct ApiDoc;
+pub struct ApiDoc;
 
 /// Shared state for all HTTP handlers
 #[derive(Clone)]

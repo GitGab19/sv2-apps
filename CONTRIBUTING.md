@@ -21,6 +21,7 @@ All types of contributions are encouraged and valued. See the [Table of Contents
 - [I Want To Contribute](#i-want-to-contribute)
   - [Project Structure](#project-structure)
   - [Contribution workflow](#contribution-workflow)
+  - [Monitoring API Schema](#monitoring-api-schema)
   - [Your First Code Contribution](#your-first-code-contribution)
   
 
@@ -111,6 +112,37 @@ The SRI project follows an open contributor model, where anyone is welcome to co
 6. **Review and Iterate** 
 
 7. **Merge and Close:** Once your pull request has been approved and all discussions have been resolved, a project maintainer will merge your changes into the `main` branch. Your contribution will then be officially part of the project. The pull request will be closed, marking the completion of your contribution.
+
+### Monitoring API Schema
+
+The `monitoring` module of `stratum-apps` exposes an HTTP API documented with OpenAPI. This schema is:
+
+1. **Auto-generated**: The `openapi.json` file is generated from code at compile time, not manually written
+2. **CI-validated**: Every PR that changes monitoring code must update `openapi.json`
+3. **Synced to consumer**: Changes trigger an issue in the sv2-ui repository
+
+#### Updating the Schema
+
+If you modify the monitoring HTTP server (endpoints, response types, etc.), you must regenerate the schema:
+
+```bash
+cd stratum-apps
+cargo run --bin generate-openapi --features monitoring > src/monitoring/openapi.json
+```
+
+Then commit the updated file along with your code changes.
+
+#### Why This Matters
+
+The `sv2-ui` project consumes this schema to generate TypeScript types and API clients. Keeping it in sync ensures the frontend stays compatible with the backend.
+
+#### API Compatibility Guidelines
+
+When modifying the monitoring API, follow these guidelines:
+
+1. **Keep existing fields backward-compatible** - The `/api/v1` endpoint fields should remain stable
+2. **Add new data via optional fields or new endpoints** - Don't modify existing response structures
+3. **Don't change field types or semantics** - Existing field definitions within the same API version are immutable
 
 ### Your First Code Contribution
 >In order to contribute, a basic learning about git and github is needed. If you're not familiar with them, have a look at https://docs.github.com/en/get-started/start-your-journey/git-and-github-learning-resources to dig into and learn how to use them.

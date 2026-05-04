@@ -1,0 +1,31 @@
+name: Validate OpenAPI
+
+on:
+  pull_request:
+    paths:
+      - 'stratum-apps/src/monitoring/**'
+      - 'stratum-apps/src/bin/generate-openapi.rs'
+
+jobs:
+  validate-openapi:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@1.85
+
+      - name: Generate fresh OpenAPI JSON
+        working-directory: stratum-apps
+        run: cargo run --bin generate-openapi --features monitoring > fresh.json
+
+      - name: Check openapi.json exists
+        run: |
+          if [ ! -f stratum-apps/src/monitoring/openapi.json ]; then
+            echo "No openapi.json committed - run: cargo run --bin generate-openapi --features monitoring > stratum-apps/src/monitoring/openapi.json"
+            exit 1
+          fi
+
+      - name: Verify openapi.json is up to date
+        run: |
+          diff -u stratum-apps/src/monitoring/openapi.json stratum-apps/fresh.json
