@@ -2021,3 +2021,61 @@ async fn multiple_tproxy_sessions() {
 
     shutdown_all!(pool, tproxy_1, tproxy_2);
 }
+
+// Demonstrates the scenario where the primary upstream abruptly disconnects.
+#[tokio::test]
+async fn test_translator_fallback_during_abrupt_disconnection() {
+    start_tracing();
+    let primary_addr = get_available_address();
+    let _primary_upstream = MockUpstream::new(
+        primary_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .disconnect_after_setup_connection_success(Duration::from_secs(1))
+    .start()
+    .await;
+
+    let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
+    let (pool_2, pool_addr_2, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
+
+    let (pool_translator_sniffer_2, pool_translator_sniffer_addr_2) =
+        start_sniffer("B", pool_addr_2, false, vec![], None);
+
+    let (translator, tproxy_addr, _) = start_sv2_translator(
+        &[primary_addr, pool_translator_sniffer_addr_2],
+        false,
+        vec![],
+        vec![],
+        None,
+        false,
+    )
+    .await;
+
+    pool_translator_sniffer_2
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+
+    pool_translator_sniffer_2
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+
+    let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
+
+    pool_translator_sniffer_2
+        .wait_for_message_type(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+        )
+        .await;
+
+    pool_translator_sniffer_2
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+        )
+        .await;
+    shutdown_all!(translator, pool_2);
+}

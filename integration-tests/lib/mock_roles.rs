@@ -1,6 +1,6 @@
 use crate::utils::{create_downstream, create_upstream, message_from_frame, wait_for_client};
 use async_channel::Sender;
-use std::{convert::TryInto, net::SocketAddr};
+use std::{convert::TryInto, net::SocketAddr, time::Duration};
 use stratum_apps::{
     stratum_core::{
         codec_sv2::StandardEitherFrame,
@@ -126,6 +126,7 @@ impl MockDownstream {
 pub struct MockUpstream {
     listening_address: SocketAddr,
     setup: WithSetup,
+    disconnect_after_setup: Option<Duration>,
 }
 
 impl MockUpstream {
@@ -133,7 +134,13 @@ impl MockUpstream {
         Self {
             listening_address,
             setup,
+            disconnect_after_setup: None,
         }
+    }
+
+    pub fn disconnect_after_setup_connection_success(mut self, delay: Duration) -> Self {
+        self.disconnect_after_setup = Some(delay);
+        self
     }
 
     pub async fn start(self) -> Sender<AnyMessage<'static>> {
@@ -183,6 +190,13 @@ impl MockUpstream {
                                 "MockUpstream: sent SetupConnectionSuccess with flags {}",
                                 flags
                             );
+
+                            if let Some(delay) = self.disconnect_after_setup {
+                                tokio::time::sleep(delay).await;
+                                downstream_sender.close();
+                                downstream_receiver.close();
+                                return;
+                            }
                         } else {
                             let error = AnyMessage::Common(CommonMessages::SetupConnectionError(
                                 SetupConnectionError {
