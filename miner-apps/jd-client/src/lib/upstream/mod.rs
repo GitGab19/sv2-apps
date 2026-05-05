@@ -14,6 +14,7 @@ use std::{net::SocketAddr, sync::Arc};
 use async_channel::{unbounded, Receiver, Sender};
 use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
+    channel_utils::ReceiverCleanup,
     fallback_coordinator::FallbackCoordinator,
     network_helpers::{connect_with_noise, resolve_host, TCP_CONNECT_TIMEOUT},
     stratum_core::{
@@ -49,6 +50,15 @@ pub struct UpstreamIo {
     channel_manager_receiver: Receiver<Sv2Frame>,
     upstream_sender: Sender<Sv2Frame>,
     upstream_receiver: Receiver<Sv2Frame>,
+}
+
+impl UpstreamIo {
+    fn close(&self) {
+        self.channel_manager_sender.close();
+        self.upstream_sender.close();
+        self.channel_manager_receiver.close_and_drain();
+        self.upstream_receiver.close_and_drain();
+    }
 }
 
 /// Represents an upstream connection (e.g., a pool).
@@ -317,8 +327,10 @@ impl Upstream {
                 &cancellation_token,
                 &setup_fallback_token,
             ) {
+                self.upstream_io.close();
                 return;
             }
+            self.upstream_io.close();
             return;
         }
 
@@ -373,6 +385,7 @@ impl Upstream {
 
                 }
             }
+            self.upstream_io.close();
             warn!("Upstream: unified message loop exited.");
 
             // signal fallback coordinator that this task has completed its cleanup

@@ -9,6 +9,7 @@ use std::{
 use async_channel::{unbounded, Receiver, Sender};
 use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
+    channel_utils::ReceiverCleanup,
     custom_mutex::Mutex,
     network_helpers::noise_stream::NoiseTcpStream,
     stratum_core::{
@@ -75,6 +76,14 @@ pub struct DownstreamIo {
     channel_manager_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
     downstream_sender: Sender<Sv2Frame>,
     downstream_receiver: Receiver<Sv2Frame>,
+}
+
+impl DownstreamIo {
+    fn close(&self) {
+        self.downstream_sender.close();
+        self.channel_manager_receiver.close_and_drain();
+        self.downstream_receiver.close_and_drain();
+    }
 }
 
 /// Represents a downstream client connected to this node.
@@ -224,6 +233,7 @@ impl Downstream {
                 &cancellation_token,
             );
             on_disconnect(self.downstream_id);
+            self.downstream_io.close();
             return;
         }
 
@@ -265,6 +275,7 @@ impl Downstream {
                 }
             }
             self.downstream_connection_token.cancel();
+            self.downstream_io.close();
             on_disconnect(self.downstream_id);
             warn!("Downstream: unified message loop exited.");
         });

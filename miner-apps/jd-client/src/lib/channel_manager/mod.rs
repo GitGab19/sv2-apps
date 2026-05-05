@@ -10,6 +10,7 @@ use std::{
 use async_channel::{unbounded, Receiver, Sender};
 use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
+    channel_utils::ReceiverCleanup,
     coinbase_output_constraints::coinbase_output_constraints_message,
     custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
@@ -265,6 +266,26 @@ pub struct ChannelManagerIo {
     tp_receiver: Receiver<TemplateDistribution<'static>>,
     downstream_sender: Arc<Mutex<HashMap<DownstreamId, Sender<DownstreamMessage>>>>,
     downstream_receiver: Receiver<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
+}
+
+impl ChannelManagerIo {
+    fn close(&self, close_template_provider: bool) {
+        self.upstream_sender.close();
+        self.jd_sender.close();
+        self.upstream_receiver.close_and_drain();
+        self.jd_receiver.close_and_drain();
+        if close_template_provider {
+            self.tp_sender.close();
+            self.tp_receiver.close_and_drain();
+        }
+        self.downstream_receiver.close_and_drain();
+        self.downstream_sender.super_safe_lock(|downstreams| {
+            for sender in downstreams.values() {
+                sender.close();
+            }
+            downstreams.clear();
+        });
+    }
 }
 
 /// Contains all the state of mutable and immutable data required
@@ -776,6 +797,9 @@ impl ChannelManager {
                 }
             }
 
+            let close_template_provider =
+                cancellation_token.is_cancelled() || !fallback_token.is_cancelled();
+            self.channel_manager_io.close(close_template_provider);
             // signal fallback coordinator that this task has completed its cleanup
             fallback_handler.done();
         });

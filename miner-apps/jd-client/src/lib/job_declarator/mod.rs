@@ -3,6 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 use async_channel::{unbounded, Receiver, Sender};
 use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
+    channel_utils::ReceiverCleanup,
     fallback_coordinator::FallbackCoordinator,
     network_helpers::{connect_with_noise, resolve_host, TCP_CONNECT_TIMEOUT},
     stratum_core::{
@@ -35,6 +36,15 @@ pub struct JobDeclaratorIo {
     channel_manager_receiver: Receiver<JobDeclaration<'static>>,
     jds_sender: Sender<Sv2Frame>,
     jds_receiver: Receiver<Sv2Frame>,
+}
+
+impl JobDeclaratorIo {
+    fn close(&self) {
+        self.channel_manager_sender.close();
+        self.jds_sender.close();
+        self.channel_manager_receiver.close_and_drain();
+        self.jds_receiver.close_and_drain();
+    }
 }
 
 /// Manages the lifecycle and communication with a Job Declarator (JDS)
@@ -201,6 +211,7 @@ impl JobDeclarator {
                 &cancellation_token,
                 &fallback_token,
             );
+            self.job_declarator_io.close();
             fallback_handler.done();
             return;
         }
@@ -247,6 +258,7 @@ impl JobDeclarator {
                     },
                 }
             }
+            self.job_declarator_io.close();
             warn!("JobDeclarator: unified message loop exited.");
 
             // signal fallback coordinator that this task has completed its cleanup

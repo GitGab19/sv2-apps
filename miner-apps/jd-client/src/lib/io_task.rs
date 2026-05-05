@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_channel::{Receiver, Sender};
 use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
+    channel_utils::ReceiverCleanup,
     fallback_coordinator::{FallbackCoordinator, FallbackHandler},
     network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf},
     stratum_core::framing_sv2::framing::Frame,
@@ -120,7 +121,7 @@ pub fn spawn_io_tasks(
                 }
 
                 inbound_tx.close();
-                outbound_rx_clone.close();
+                outbound_rx_clone.close_and_drain();
                 drop(inbound_tx);
                 drop(outbound_rx_clone);
 
@@ -162,12 +163,12 @@ pub fn spawn_io_tasks(
                                     trace!("Sending outbound frame");
                                     if let Err(e) = writer.write_frame(frame.into()).await {
                                         error!(error=?e, "Writer error");
-                                        outbound_rx.close();
+                                        outbound_rx.close_and_drain();
                                         break;
                                     }
                                 }
                                 Err(_) => {
-                                    outbound_rx.close();
+                                    outbound_rx.close_and_drain();
                                     warn!("Outbound channel closed");
                                     break;
                                 }
@@ -175,7 +176,7 @@ pub fn spawn_io_tasks(
                         }
                     }
                 }
-                outbound_rx.close();
+                outbound_rx.close_and_drain();
                 inbound_tx_clone.close();
                 drop(outbound_rx);
                 drop(inbound_tx_clone);

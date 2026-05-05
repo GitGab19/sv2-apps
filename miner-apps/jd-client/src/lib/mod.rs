@@ -218,9 +218,16 @@ impl JobDeclaratorClient {
                 let cancellation_token_tp = self.cancellation_token.clone();
                 let task_manager_cl = task_manager.clone();
 
-                template_receiver
+                if let Err(e) = template_receiver
                     .start(address, cancellation_token_tp, task_manager_cl)
-                    .await;
+                    .await
+                {
+                    error!(error = ?e, "Failed to start SV2 template receiver");
+                    self.cancellation_token.cancel();
+                    self.shutdown_notify.notify_waiters();
+                    self.is_alive.store(false, Ordering::Relaxed);
+                    return;
+                }
 
                 info!("Sv2 Template Provider setup done");
             }
