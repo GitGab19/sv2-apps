@@ -3,6 +3,7 @@ mod common_message_handler;
 use async_channel::{unbounded, Receiver, Sender};
 use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
+    channel_utils::ReceiverCleanup,
     key_utils::Secp256k1PublicKey,
     network_helpers::{self, connect_with_noise, resolve_host_port},
     stratum_core::{
@@ -31,6 +32,15 @@ pub struct Sv2TpIo {
     channel_manager_receiver: Receiver<TemplateDistribution<'static>>,
     tp_sender: Sender<Sv2Frame>,
     tp_receiver: Receiver<Sv2Frame>,
+}
+
+impl Sv2TpIo {
+    fn close(&self) {
+        self.channel_manager_sender.close();
+        self.tp_sender.close();
+        self.channel_manager_receiver.close_and_drain();
+        self.tp_receiver.close_and_drain();
+    }
 }
 
 #[derive(Clone)]
@@ -176,7 +186,10 @@ impl Sv2Tp {
         task_manager: Arc<TaskManager>,
     ) -> PoolResult<(), error::TemplateProvider> {
         info!("Initialized state for starting template receiver");
-        self.setup_connection(socket_address).await?;
+        if let Err(e) = self.setup_connection(socket_address).await {
+            self.sv2_tp_io.close();
+            return Err(e);
+        }
 
         info!("Setup Connection done. connection with template receiver is now done");
         task_manager.spawn(async move {
@@ -215,6 +228,7 @@ impl Sv2Tp {
                     },
                 }
             }
+            self.sv2_tp_io.close();
             warn!("TemplateReceiver: unified message loop exited.");
         });
         Ok(())

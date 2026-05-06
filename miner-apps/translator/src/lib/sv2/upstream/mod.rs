@@ -8,6 +8,7 @@ use crate::{
 use async_channel::{unbounded, Receiver, Sender};
 use std::{net::SocketAddr, sync::Arc};
 use stratum_apps::{
+    channel_utils::ReceiverCleanup,
     fallback_coordinator::FallbackCoordinator,
     network_helpers::{self, connect_with_noise, resolve_host, TCP_CONNECT_TIMEOUT},
     stratum_core::{
@@ -56,10 +57,12 @@ impl UpstreamIo {
         }
     }
 
-    fn drop(&self) {
+    fn close(&self) {
         debug!("Closing all upstream channels");
-        self.upstream_receiver.close();
         self.upstream_sender.close();
+        self.channel_manager_sender.close();
+        self.upstream_receiver.close_and_drain();
+        self.channel_manager_receiver.close_and_drain();
     }
 }
 
@@ -290,10 +293,12 @@ impl Upstream {
 
             _ = cancellation_token.cancelled() => {
                 info!("Upstream: shutdown signal received during connection setup.");
+                self.upstream_io.close();
                 return Ok(());
             }
             _ = fallback_token.cancelled() => {
                 info!("Upstream: fallback signal received during connection setup.");
+                self.upstream_io.close();
                 return Ok(());
             }
             result = self.setup_connection() => {
@@ -529,7 +534,7 @@ impl Upstream {
                 }
             }
 
-            self.upstream_io.drop();
+            self.upstream_io.close();
             warn!("Upstream: task shutting down cleanly.");
 
             // signal fallback coordinator that this task has completed its cleanup

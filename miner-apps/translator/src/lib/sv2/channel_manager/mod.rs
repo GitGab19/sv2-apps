@@ -10,6 +10,7 @@ use async_channel::{Receiver, Sender};
 use dashmap::DashMap;
 use std::sync::Arc;
 use stratum_apps::{
+    channel_utils::ReceiverCleanup,
     custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
     stratum_core::{
@@ -87,12 +88,12 @@ impl ChannelManagerIo {
         }
     }
 
-    fn drop(&self) {
+    fn close(&self) {
         debug!("Dropping channel manager channels");
-        self.upstream_receiver.close();
         self.upstream_sender.close();
-        self.sv1_server_receiver.close();
         self.sv1_server_sender.close();
+        self.upstream_receiver.close_and_drain();
+        self.sv1_server_receiver.close_and_drain();
     }
 }
 
@@ -172,6 +173,19 @@ pub struct ChannelManager {
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl ChannelManager {
+    fn reset_state(&self) {
+        self.pending_downstream_channels.clear();
+        self.extended_channels.clear();
+        self.group_channels.clear();
+        self.share_sequence_counters.clear();
+        self.negotiated_extensions
+            .super_safe_lock(|data| data.clear());
+        self.aggregated_extranonce_allocator
+            .super_safe_lock(|allocator| *allocator = None);
+        self.aggregated_channel_state
+            .set(AggregatedState::NoChannel);
+    }
+
     fn handle_error_action(
         &self,
         context: &str,
@@ -314,19 +328,13 @@ impl ChannelManager {
                 tokio::select! {
                     biased;
                     _ = cancellation_token.cancelled() => {
-                        info!("ChannelManager: received shutdown signal.");
+                        info!("ChannelManager: received shutdown signal, resetting state");
+                        self.reset_state();
                         break;
                     }
                     _ = fallback_token.cancelled() => {
                         info!("ChannelManager: fallback triggered, resetting state");
-                        self.pending_downstream_channels.clear();
-                        self.extended_channels.clear();
-                        self.group_channels.clear();
-                        self.share_sequence_counters.clear();
-                        self.negotiated_extensions.super_safe_lock(|data| data.clear());
-                        self.aggregated_extranonce_allocator
-                            .super_safe_lock(|allocator| *allocator = None);
-                        self.aggregated_channel_state.set(AggregatedState::NoChannel);
+                        self.reset_state();
                         break;
                     }
                     res = self.clone().handle_upstream_frame() => {
@@ -360,7 +368,7 @@ impl ChannelManager {
                 }
             }
 
-            self.channel_manager_io.drop();
+            self.channel_manager_io.close();
             warn!("ChannelManager: unified message loop exited.");
 
             // signal fallback coordinator that this task has completed its cleanup

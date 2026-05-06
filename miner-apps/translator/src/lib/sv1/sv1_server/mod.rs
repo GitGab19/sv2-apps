@@ -22,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use stratum_apps::{
+    channel_utils::ReceiverCleanup,
     custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
     network_helpers::sv1_connection::ConnectionSV1,
@@ -77,11 +78,18 @@ impl Sv1ServerIo {
         }
     }
 
-    fn drop(&self) {
-        self.channel_manager_receiver.close();
+    fn close(&self) {
         self.channel_manager_sender.close();
-        self.downstream_to_sv1_server_receiver.close();
         self.downstream_to_sv1_server_sender.close();
+        self.channel_manager_receiver.close_and_drain();
+        self.downstream_to_sv1_server_receiver.close_and_drain();
+        self.sv1_server_to_downstream_sender
+            .super_safe_lock(|downstream_senders| {
+                for sender in downstream_senders.values() {
+                    sender.close();
+                }
+                downstream_senders.clear();
+            });
     }
 }
 
@@ -245,7 +253,7 @@ impl Sv1Server {
         self.pending_target_updates
             .safe_lock(|updates| updates.clear())
             .ok();
-        self.sv1_server_io.drop();
+        self.sv1_server_io.close();
     }
 
     /// Creates a new SV1 server instance.

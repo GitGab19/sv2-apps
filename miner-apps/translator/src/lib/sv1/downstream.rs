@@ -12,6 +12,7 @@ use std::{
     time::Instant,
 };
 use stratum_apps::{
+    channel_utils::ReceiverCleanup,
     custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
     stratum_core::{
@@ -52,10 +53,11 @@ impl DownstreamIo {
         }
     }
 
-    fn drop(&self) {
+    fn close(&self) {
         debug!("Dropping downstream channel state");
-        self.downstream_sv1_receiver.close();
         self.downstream_sv1_sender.close();
+        self.downstream_sv1_receiver.close_and_drain();
+        self.sv1_server_receiver.close_and_drain();
     }
 }
 
@@ -335,7 +337,7 @@ impl Downstream {
 
             warn!("Downstream {downstream_id}: unified task shutting down");
             self.downstream_cancellation_token.cancel();
-            self.downstream_io.drop();
+            self.downstream_io.close();
             on_disconnect().await;
             // signal fallback coordinator that this task has completed its cleanup
             fallback_handler.done();
