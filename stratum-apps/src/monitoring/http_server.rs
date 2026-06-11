@@ -11,7 +11,7 @@ use super::{
         ServerExtendedChannelInfo, ServerMonitoring, ServerStandardChannelInfo, ServerSummary,
     },
     snapshot_cache::SnapshotCache,
-    sv1::{Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
+    sv1::{MinerTelemetry, Sv1ClientInfo, Sv1ClientsMonitoring, Sv1ClientsSummary},
     GlobalInfo,
 };
 use axum::{
@@ -66,6 +66,7 @@ use utoipa_swagger_ui::SwaggerUi;
         ExtendedChannelInfo,
         StandardChannelInfo,
         Sv1ClientInfo,
+        MinerTelemetry,
         Sv1ClientsSummary,
         HealthResponse,
         ErrorResponse,
@@ -958,10 +959,12 @@ mod tests {
         Sv1ClientInfo {
             client_id: id,
             channel_id: Some(id as u32),
+            connection_ip: Some(format!("192.0.2.{}", id)),
             authorized_worker_name: format!("worker-{}", id),
             user_identity: format!("miner-{}", id),
             target_hex: "00ff".into(),
             hashrate,
+            miner_telemetry: None,
             stable_hashrate: false,
             extranonce1_hex: "aabb".into(),
             extranonce2_len: 8,

@@ -11,6 +11,7 @@ use utoipa::ToSchema;
 pub struct Sv1ClientInfo {
     pub client_id: usize,
     pub channel_id: Option<u32>,
+    pub connection_ip: Option<String>,
     pub authorized_worker_name: String,
     pub user_identity: String,
     pub target_hex: String,
@@ -20,6 +21,32 @@ pub struct Sv1ClientInfo {
     pub extranonce2_len: usize,
     pub version_rolling_mask: Option<String>,
     pub version_rolling_min_bit: Option<String>,
+    pub miner_telemetry: Option<MinerTelemetry>,
+}
+
+/// Telemetry reported by the miner's management interface.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MinerTelemetry {
+    /// IP address queried for miner management telemetry.
+    pub ip: String,
+    /// Miner manufacturer or brand reported by the management interface.
+    pub make: Option<String>,
+    /// Miner model reported by the management interface.
+    pub model: Option<String>,
+    /// Firmware version reported by the miner, when exposed.
+    pub firmware_version: Option<String>,
+    /// Miner-reported hashrate in hashes per second.
+    pub reported_hashrate_hs: Option<f64>,
+    /// Current miner power consumption in watts.
+    pub power_consumption_w: Option<f64>,
+    /// Miner efficiency in joules per terahash.
+    pub efficiency_j_per_th: Option<f64>,
+    /// Average miner temperature in degrees Celsius.
+    pub average_temperature_c: Option<f64>,
+    /// Total miner system uptime in seconds.
+    pub uptime_secs: Option<u64>,
+    /// Whether the miner reports that hashing is currently running.
+    pub is_mining: Option<bool>,
 }
 
 /// Aggregate information about SV1 client connections
@@ -63,6 +90,7 @@ mod tests {
         Sv1ClientInfo {
             client_id: id,
             channel_id: Some(id as u32),
+            connection_ip: Some(format!("192.0.2.{}", id)),
             authorized_worker_name: format!("worker-{}", id),
             user_identity: format!("miner-{}", id),
             target_hex: "00ff".into(),
@@ -72,6 +100,7 @@ mod tests {
             extranonce2_len: 8,
             version_rolling_mask: Some("ffffffff".into()),
             version_rolling_min_bit: Some("00000000".into()),
+            miner_telemetry: None,
         }
     }
 

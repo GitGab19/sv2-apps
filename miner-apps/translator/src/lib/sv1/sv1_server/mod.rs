@@ -413,6 +413,7 @@ impl Sv1Server {
                                     sv1_server_receiver,
                                     first_target,
                                     Some(self.config.downstream_difficulty_config.min_individual_miner_hashrate),
+                                    addr.ip(),
                                     connection_token,
                                 );
                                 // vardiff initialization (only if enabled)

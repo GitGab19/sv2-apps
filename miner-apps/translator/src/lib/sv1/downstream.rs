@@ -5,6 +5,7 @@ use crate::{
 use async_channel::{Receiver, Sender};
 use std::{
     future::Future,
+    net::IpAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -68,6 +69,7 @@ pub struct DownstreamData {
     pub extranonce2_len: usize,
     pub target: Target,
     pub hashrate: Option<Hashrate>,
+    pub connection_ip: IpAddr,
     pub version_rolling_mask: Option<HexU32Be>,
     pub version_rolling_min_bit: Option<HexU32Be>,
     pub last_job_version_field: Option<u32>,
@@ -89,7 +91,7 @@ pub struct DownstreamData {
 }
 
 impl DownstreamData {
-    pub fn new(hashrate: Option<Hashrate>, target: Target) -> Self {
+    pub fn new(hashrate: Option<Hashrate>, target: Target, connection_ip: IpAddr) -> Self {
         DownstreamData {
             channel_id: None,
             extranonce1: vec![0; 8]
@@ -98,6 +100,7 @@ impl DownstreamData {
             extranonce2_len: 4,
             target,
             hashrate,
+            connection_ip,
             version_rolling_mask: None,
             version_rolling_min_bit: None,
             last_job_version_field: None,
@@ -240,9 +243,14 @@ impl Downstream {
         sv1_server_receiver: Receiver<json_rpc::Message>,
         target: Target,
         hashrate: Option<Hashrate>,
+        connection_ip: IpAddr,
         downstream_cancellation_token: CancellationToken,
     ) -> Self {
-        let downstream_data = Arc::new(Mutex::new(DownstreamData::new(hashrate, target)));
+        let downstream_data = Arc::new(Mutex::new(DownstreamData::new(
+            hashrate,
+            target,
+            connection_ip,
+        )));
         let downstream_channel_io = DownstreamIo::new(
             downstream_sv1_sender,
             downstream_sv1_receiver,

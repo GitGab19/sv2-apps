@@ -12,10 +12,12 @@ fn downstream_to_sv1_client_info(downstream: &Downstream) -> Option<Sv1ClientInf
         .safe_lock(|dd| Sv1ClientInfo {
             client_id: downstream.downstream_id,
             channel_id: dd.channel_id,
+            connection_ip: Some(dd.connection_ip.to_string()),
             authorized_worker_name: dd.authorized_worker_name.clone(),
             user_identity: dd.user_identity.clone(),
             target_hex: hex::encode(dd.target.to_be_bytes()),
             hashrate: dd.hashrate,
+            miner_telemetry: None,
             stable_hashrate: dd.stable_hashrate,
             extranonce1_hex: hex::encode(&dd.extranonce1),
             extranonce2_len: dd.extranonce2_len,
