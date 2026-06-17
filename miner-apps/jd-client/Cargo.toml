@@ -32,6 +32,6 @@ toml = "1.1.2"
 
 [features]
 default = ["monitoring"]
-monitoring = ["stratum-apps/monitoring"]
+monitoring = ["stratum-apps/asic-rs-telemetry"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
