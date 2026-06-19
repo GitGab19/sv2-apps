@@ -43,7 +43,10 @@ use stratum_apps::{
                 build_sv2_open_extended_mining_channel,
                 build_sv2_submit_shares_extended_from_sv1_submit,
             },
-            sv2_to_sv1::{build_sv1_notify_from_sv2, build_sv1_set_difficulty_from_sv2_target},
+            sv2_to_sv1::{
+                build_sv1_notify_from_sv2,
+                build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding,
+            },
         },
         sv1_api::{json_rpc, server_to_client, utils::HexU32Be, IsServer},
     },
@@ -53,6 +56,8 @@ use stratum_apps::{
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
+
+const SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING: f64 = 1.0;
 
 #[derive(Clone)]
 struct Sv1ServerIo {
@@ -834,12 +839,12 @@ impl Sv1Server {
                         }
                     }
 
-                    let set_difficulty = build_sv1_set_difficulty_from_sv2_target(first_target)
-                        .map_err(|_| {
-                            TproxyError::shutdown(TproxyErrorKind::General(
-                                "Failed to generate set_difficulty".into(),
-                            ))
-                        })?;
+                    let set_difficulty =
+                        build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
+                            first_target,
+                            SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                        )
+                        .map_err(TproxyError::shutdown)?;
                     // send the set_difficulty message to the downstream
                     if let Some(sender) = self
                         .sv1_server_io
@@ -1157,16 +1162,20 @@ impl Sv1Server {
             .collect();
 
         for (downstream_id, sender) in tasks {
-            let set_difficulty_msg = match build_sv1_set_difficulty_from_sv2_target(target) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    error!(
-                        "Failed to build SetDifficulty for downstream {}: {:?}",
-                        downstream_id, e
-                    );
-                    return Err(TproxyError::shutdown(e));
-                }
-            };
+            let set_difficulty_msg =
+                match build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
+                    target,
+                    SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                ) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        error!(
+                            "Failed to build SetDifficulty for downstream {}: {:?}",
+                            downstream_id, e
+                        );
+                        return Err(TproxyError::shutdown(e));
+                    }
+                };
             if let Err(e) = sender.send(set_difficulty_msg).await {
                 error!(
                     "Failed to send SetDifficulty to downstream {}: {:?}",
@@ -1230,16 +1239,20 @@ impl Sv1Server {
             }
         });
 
-        let set_difficulty_msg = match build_sv1_set_difficulty_from_sv2_target(target) {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!(
-                    "Failed to build SetDifficulty for downstream {}: {:?}",
-                    downstream_id, e
-                );
-                return Err(TproxyError::shutdown(e));
-            }
-        };
+        let set_difficulty_msg =
+            match build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
+                target,
+                SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+            ) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    error!(
+                        "Failed to build SetDifficulty for downstream {}: {:?}",
+                        downstream_id, e
+                    );
+                    return Err(TproxyError::shutdown(e));
+                }
+            };
 
         let sender = self
             .sv1_server_io
