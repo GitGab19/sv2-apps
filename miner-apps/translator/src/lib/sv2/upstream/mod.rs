@@ -6,7 +6,13 @@ use crate::{
     utils::UpstreamEntry,
 };
 use async_channel::{Receiver, Sender, unbounded};
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
+};
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
     fallback_coordinator::FallbackCoordinator,
@@ -21,6 +27,7 @@ use stratum_apps::{
         handlers_sv2::HandleCommonMessagesFromServerOwnedAsync,
         parsers_sv2::AnyMessageOwned,
     },
+    sync::SharedLock,
     task_manager::TaskManager,
     utils::{
         protocol_message_type::{MessageType, protocol_message_type},
@@ -87,6 +94,8 @@ pub struct Upstream {
     upstream_io: UpstreamIo,
     /// Extensions that the translator requires (must be supported by server)
     required_extensions: Vec<u16>,
+    negotiated_extensions: SharedLock<Vec<u16>>,
+    next_extension_request_id: Arc<AtomicU16>,
     address: SocketAddr,
 }
 
@@ -178,6 +187,7 @@ impl Upstream {
         fallback_coordinator: FallbackCoordinator,
         task_manager: Arc<TaskManager>,
         required_extensions: Vec<u16>,
+        negotiated_extensions: SharedLock<Vec<u16>>,
     ) -> TproxyResult<Self, error::Upstream> {
         info!(
             "Trying to connect to upstream at {}:{}",
@@ -246,6 +256,8 @@ impl Upstream {
                                 Ok(Self {
                                     upstream_io,
                                     required_extensions: required_extensions.clone(),
+                                    negotiated_extensions,
+                                    next_extension_request_id: Arc::new(AtomicU16::new(1)),
                                     address: resolved_addr,
                                 })
                             }
@@ -383,33 +395,40 @@ impl Upstream {
             .await?;
         debug!("Upstream: handshake completed successfully.");
 
-        // Send RequestExtensions message if there are any required extensions
+        // Send RequestExtensions message if there are any required extensions.
         if !self.required_extensions.is_empty() {
-            let require_extensions = RequestExtensionsOwned {
-                request_id: 1,
-                requested_extensions: Seq064KOwned::new(self.required_extensions.clone())
-                    .map_err(TproxyError::shutdown)?,
-            };
-
-            info!(
-                "Sending RequestExtensions message to upstream: {:?}",
-                require_extensions
-            );
-
-            let sv2_frame: Sv2Frame = AnyMessageOwned::Extensions(require_extensions.into())
-                .try_into()
-                .map_err(TproxyError::shutdown)?;
-
-            self.upstream_io
-                .upstream_sender
-                .send(sv2_frame)
-                .await
-                .map_err(|e| {
-                    error!("Failed to send message to upstream: {:?}", e);
-                    TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
-                })?;
+            self.request_extensions(self.required_extensions.clone())
+                .await?;
         }
         Ok(())
+    }
+
+    async fn request_extensions(
+        &self,
+        requested_extensions: Vec<u16>,
+    ) -> TproxyResult<(), error::Upstream> {
+        let request = RequestExtensionsOwned {
+            request_id: self
+                .next_extension_request_id
+                .fetch_add(1, Ordering::Relaxed),
+            requested_extensions: Seq064KOwned::new(requested_extensions)
+                .map_err(TproxyError::shutdown)?,
+        };
+
+        info!("Sending RequestExtensions message to upstream: {request:?}");
+
+        let frame: Sv2Frame = AnyMessageOwned::Extensions(request.into())
+            .try_into()
+            .map_err(TproxyError::shutdown)?;
+
+        self.upstream_io
+            .upstream_sender
+            .send(frame)
+            .await
+            .map_err(|e| {
+                error!("Failed to send RequestExtensions upstream: {e:?}");
+                TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
+            })
     }
 
     /// Handles one SV2 frame received from upstream.

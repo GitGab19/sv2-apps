@@ -23,6 +23,7 @@ use std::{
 use stratum_apps::{
     fallback_coordinator::FallbackCoordinator,
     payout::PayoutMode,
+    sync::SharedLock,
     task_manager::TaskManager,
     utils::types::{GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS, Sv2Frame},
 };
@@ -472,6 +473,7 @@ impl TranslatorSv2 {
                     fallback_coordinator.clone(),
                     task_manager.clone(),
                     required_extensions.clone(),
+                    channel_manager_instance.negotiated_extensions.clone(),
                 )
                 .await
                 {
@@ -532,6 +534,7 @@ async fn try_initialize_upstream(
     fallback_coordinator: FallbackCoordinator,
     task_manager: Arc<TaskManager>,
     required_extensions: Vec<u16>,
+    negotiated_extensions: SharedLock<Vec<u16>>,
 ) -> Result<(), TproxyErrorKind> {
     let upstream = Upstream::new(
         upstream_addr,
@@ -541,6 +544,7 @@ async fn try_initialize_upstream(
         fallback_coordinator.clone(),
         task_manager.clone(),
         required_extensions,
+        negotiated_extensions,
     )
     .await?;
 
