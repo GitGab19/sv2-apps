@@ -578,18 +578,27 @@ impl Downstream {
     pub(super) async fn handle_sv1_handshake_completion(
         &self,
     ) -> TproxyResult<(), error::Downstream> {
-        let (cached_set_difficulty, cached_notify, downstream_id) = self
+        let completion = self
             .downstream_data
             .with(|d| {
-                self.sv1_handshake_complete
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                (
+                if self.sv1_handshake_complete.swap(true, Ordering::SeqCst) {
+                    return None;
+                }
+
+                Some((
                     d.cached_set_difficulty.take(),
                     d.cached_notify.take(),
                     self.downstream_id,
-                )
+                ))
             })
             .map_err(TproxyError::shutdown)?;
+        let Some((cached_set_difficulty, cached_notify, downstream_id)) = completion else {
+            debug!(
+                "Down: Ignoring repeated SV1 handshake completion for downstream {}",
+                self.downstream_id
+            );
+            return Ok(());
+        };
         debug!("Down: SV1 handshake completed for downstream");
 
         // Send cached messages in correct order: set_difficulty first, then notify
@@ -642,5 +651,59 @@ impl Downstream {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_channel::unbounded;
+
+    #[tokio::test]
+    async fn repeated_handshake_completion_preserves_cached_difficulty() {
+        let (downstream_sv1_sender, downstream_sv1_receiver) = unbounded();
+        let (_downstream_sender, downstream_receiver) = unbounded();
+        let (sv1_server_sender, _sv1_server_receiver) = unbounded();
+        let (_sv1_server_sender, sv1_server_receiver) = unbounded();
+        let old_target = Target::from_le_bytes([0x11; 32]);
+        let new_target = Target::from_le_bytes([0x22; 32]);
+        let downstream = Downstream::new(
+            1,
+            downstream_sv1_sender,
+            downstream_receiver,
+            sv1_server_sender,
+            sv1_server_receiver,
+            old_target,
+            None,
+            #[cfg(feature = "monitoring")]
+            "127.0.0.1".parse().unwrap(),
+            CancellationToken::new(),
+        );
+
+        downstream
+            .sv1_handshake_complete
+            .store(true, Ordering::SeqCst);
+        let set_difficulty: Message =
+            serde_json::from_str(r#"{"id":null,"method":"mining.set_difficulty","params":[1.0]}"#)
+                .unwrap();
+        downstream
+            .downstream_data
+            .with(|data| {
+                data.cached_set_difficulty = Some(set_difficulty);
+                data.pending_target = Some(new_target);
+            })
+            .unwrap();
+
+        downstream.handle_sv1_handshake_completion().await.unwrap();
+
+        assert!(downstream_sv1_receiver.try_recv().is_err());
+        downstream
+            .downstream_data
+            .with(|data| {
+                assert_eq!(data.target, old_target);
+                assert_eq!(data.pending_target, Some(new_target));
+                assert!(data.cached_set_difficulty.is_some());
+            })
+            .unwrap();
     }
 }
