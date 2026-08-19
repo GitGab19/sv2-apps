@@ -3,7 +3,7 @@ pub mod common_message_handler;
 use crate::{
     error::{self, Action, LoopControl, TproxyError, TproxyErrorKind, TproxyResult},
     io_task::spawn_io_tasks,
-    utils::UpstreamEntry,
+    utils::{UpstreamEndpoint, UpstreamEntry},
 };
 use async_channel::{Receiver, Sender, unbounded};
 use std::{
@@ -92,6 +92,8 @@ impl UpstreamIo {
 #[derive(Debug, Clone)]
 pub struct Upstream {
     upstream_io: UpstreamIo,
+    upstream_endpoint: UpstreamEndpoint,
+    protocol_reconnect_sender: Sender<UpstreamEndpoint>,
     /// Extensions that the translator requires (must be supported by server)
     required_extensions: Vec<u16>,
     negotiated_extensions: SharedLock<Vec<u16>>,
@@ -188,6 +190,7 @@ impl Upstream {
         task_manager: Arc<TaskManager>,
         required_extensions: Vec<u16>,
         negotiated_extensions: SharedLock<Vec<u16>>,
+        protocol_reconnect_sender: Sender<UpstreamEndpoint>,
     ) -> TproxyResult<Self, error::Upstream> {
         info!(
             "Trying to connect to upstream at {}:{}",
@@ -255,6 +258,8 @@ impl Upstream {
 
                                 Ok(Self {
                                     upstream_io,
+                                    upstream_endpoint: UpstreamEndpoint::from(upstream),
+                                    protocol_reconnect_sender,
                                     required_extensions: required_extensions.clone(),
                                     negotiated_extensions,
                                     next_extension_request_id: Arc::new(AtomicU16::new(1)),

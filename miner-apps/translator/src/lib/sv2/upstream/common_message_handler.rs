@@ -79,17 +79,38 @@ impl HandleCommonMessagesFromServerOwnedAsync for Upstream {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
-        todo!()
+        let requested_host = std::str::from_utf8(msg.new_host.as_ref())
+            .map_err(|_| TproxyError::fallback(TproxyErrorKind::InvalidReconnectHost))?;
+
+        let mut reconnect_endpoint = self.upstream_endpoint.clone();
+        if !requested_host.is_empty() {
+            reconnect_endpoint.host = requested_host.to_owned();
+        }
+        if msg.new_port != 0 {
+            reconnect_endpoint.port = msg.new_port;
+        }
+
+        self.protocol_reconnect_sender
+            .send(reconnect_endpoint)
+            .await
+            .map_err(|_| TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{error::Action, sv2::upstream::UpstreamIo};
+    use crate::{
+        sv2::upstream::UpstreamIo,
+        utils::{UpstreamEndpoint, UpstreamEntry},
+    };
     use async_channel::unbounded;
-    use std::sync::{Arc, atomic::AtomicU16};
+    use std::{
+        str::FromStr,
+        sync::{Arc, atomic::AtomicU16},
+    };
     use stratum_apps::{
+        key_utils::Secp256k1PublicKey,
         stratum_core::{
             extensions_sv2::EXTENSION_TYPE_EXTENSIONS_NEGOTIATION,
             framing_sv2::SV2_FRAME_HEADER_SIZE,
@@ -98,10 +119,6 @@ mod tests {
         sync::SharedLock,
         utils::types::Sv2Frame,
     };
-
-    fn upstream() -> Upstream {
-        upstream_with_extensions(vec![], vec![]).0
-    }
 
     fn upstream_with_extensions(
         required_extensions: Vec<u16>,
@@ -116,6 +133,7 @@ mod tests {
         let (channel_manager_sender, _channel_manager_receiver) = unbounded();
         let (_channel_manager_sender, channel_manager_receiver) = unbounded();
         let negotiated_extensions = SharedLock::new(negotiated_extensions);
+        let (protocol_reconnect_sender, _protocol_reconnect_receiver) = unbounded();
 
         (
             Upstream {
@@ -125,6 +143,8 @@ mod tests {
                     channel_manager_sender,
                     channel_manager_receiver,
                 ),
+                upstream_endpoint: UpstreamEndpoint::from(&test_upstream_entry()),
+                protocol_reconnect_sender,
                 required_extensions,
                 negotiated_extensions: negotiated_extensions.clone(),
                 next_extension_request_id: Arc::new(AtomicU16::new(1)),
@@ -133,6 +153,26 @@ mod tests {
             upstream_outbound_receiver,
             negotiated_extensions,
         )
+    }
+
+    fn test_upstream_entry() -> UpstreamEntry {
+        UpstreamEntry {
+            host: "current.pool.example".to_owned(),
+            port: 3333,
+            authority_pubkey: Secp256k1PublicKey::from_str(
+                "9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan",
+            )
+            .unwrap(),
+            tried_or_flagged: true,
+            user_identity: "test-user".to_owned(),
+        }
+    }
+
+    fn upstream_with_reconnect() -> (Upstream, async_channel::Receiver<UpstreamEndpoint>) {
+        let (mut upstream, _, _) = upstream_with_extensions(vec![], vec![]);
+        let (protocol_reconnect_sender, protocol_reconnect_receiver) = unbounded();
+        upstream.protocol_reconnect_sender = protocol_reconnect_sender;
+        (upstream, protocol_reconnect_receiver)
     }
 
     #[tokio::test]
@@ -172,5 +212,47 @@ mod tests {
             panic!("expected RequestExtensions");
         };
         assert_eq!(request.requested_extensions.into_inner(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn reconnect_request_preserves_pool_identity_and_authority() {
+        let (mut upstream, protocol_reconnect_receiver) = upstream_with_reconnect();
+        let current_endpoint = upstream.upstream_endpoint.clone();
+        let reconnect = ReconnectOwned {
+            new_host: "new.pool.example".try_into().unwrap(),
+            new_port: 4444,
+        };
+
+        upstream
+            .handle_reconnect(None, reconnect, None)
+            .await
+            .unwrap();
+
+        let requested_endpoint = protocol_reconnect_receiver.recv().await.unwrap();
+        assert_eq!(requested_endpoint.host, "new.pool.example");
+        assert_eq!(requested_endpoint.port, 4444);
+        assert_eq!(
+            requested_endpoint.authority_pubkey.0,
+            current_endpoint.authority_pubkey.0
+        );
+        assert_eq!(
+            requested_endpoint.user_identity,
+            current_endpoint.user_identity
+        );
+
+        upstream
+            .handle_reconnect(
+                None,
+                ReconnectOwned {
+                    new_host: "".try_into().unwrap(),
+                    new_port: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let requested_endpoint = protocol_reconnect_receiver.recv().await.unwrap();
+        assert_eq!(requested_endpoint.host, current_endpoint.host);
+        assert_eq!(requested_endpoint.port, current_endpoint.port);
     }
 }

@@ -39,7 +39,7 @@ use crate::{
     error::TproxyErrorKind,
     sv1::Sv1Server,
     sv2::{ChannelManager, Upstream},
-    utils::{TproxyMode, UpstreamEntry},
+    utils::{TproxyMode, UpstreamEndpoint, UpstreamEntry},
 };
 
 pub mod config;
@@ -50,6 +50,21 @@ mod monitoring;
 pub mod sv1;
 pub mod sv2;
 pub mod utils;
+
+/// Why the translator must rebuild its upstream-dependent components.
+///
+/// Both variants share the same teardown lifecycle through [`FallbackCoordinator`], but they have
+/// different endpoint-selection policies:
+/// - [`Self::ConfiguredFallback`] selects from the configured upstream list.
+/// - [`Self::ProtocolReconnect`] first tries the endpoint supplied by the current pool, preserving
+///   that pool's authority key and user identity, then falls back to the configured list.
+#[derive(Debug)]
+enum UpstreamRecoveryTrigger {
+    ConfiguredFallback,
+    ProtocolReconnect {
+        requested_endpoint: UpstreamEndpoint,
+    },
+}
 
 /// The main struct that manages the SV1/SV2 translator.
 #[derive(Clone)]
@@ -102,6 +117,7 @@ impl TranslatorSv2 {
 
         let cancellation_token = self.cancellation_token.clone();
         let mut fallback_coordinator = FallbackCoordinator::new();
+        let (protocol_reconnect_sender, protocol_reconnect_receiver) = unbounded();
         let tproxy_mode = TproxyMode::from(self.config.aggregate_channels);
 
         let task_manager = Arc::new(TaskManager::new());
@@ -168,6 +184,7 @@ impl TranslatorSv2 {
                 sv1_server.clone(),
                 self.config.required_extensions.clone(),
                 channel_manager.clone(),
+                protocol_reconnect_sender.clone(),
             )
             .await
         {
@@ -206,99 +223,170 @@ impl TranslatorSv2 {
         let mut fallback_token = fallback_coordinator.token();
 
         loop {
-            tokio::select! {
+            let recovery_trigger = tokio::select! {
                 biased;
                 _ = cancellation_token.cancelled() => {
                     break;
                 }
+                reconnect_endpoint = protocol_reconnect_receiver.recv() => {
+                    match reconnect_endpoint {
+                        Ok(requested_endpoint) => UpstreamRecoveryTrigger::ProtocolReconnect {
+                            requested_endpoint,
+                        },
+                        Err(e) => {
+                            error!("Reconnect request channel closed: {e}");
+                            cancellation_token.cancel();
+                            break;
+                        }
+                    }
+                }
                 _ = fallback_token.cancelled() => {
-                    info!("Preparing fallback");
-                                // Trigger fallback and wait for all components to finish cleanup
-                                fallback_coordinator.trigger_fallback_and_wait().await;
-                                info!("All components finished fallback cleanup");
+                    UpstreamRecoveryTrigger::ConfiguredFallback
+                }
+            };
 
-                                // Create a fresh FallbackCoordinator for the reconnection attempt
-                                fallback_coordinator = FallbackCoordinator::new();
-                                fallback_token = fallback_coordinator.token();
-
-                                // Recreate channels and components (old ones were closed during fallback)
-                                let (channel_manager_to_upstream_sender, channel_manager_to_upstream_receiver) =
-                                    unbounded();
-                                let (upstream_to_channel_manager_sender, upstream_to_channel_manager_receiver) =
-                                    unbounded();
-                                let (channel_manager_to_sv1_server_sender, channel_manager_to_sv1_server_receiver) =
-                                    unbounded();
-                                let (sv1_server_to_channel_manager_sender, sv1_server_to_channel_manager_receiver) =
-                                    unbounded();
-
-                                sv1_server = Arc::new(Sv1Server::new(
-                                    downstream_addr,
-                                    channel_manager_to_sv1_server_receiver,
-                                    sv1_server_to_channel_manager_sender,
-                                    self.config.clone(),
-                                    tproxy_mode
-                                ));
-
-                                channel_manager = Arc::new(ChannelManager::new(
-                                    channel_manager_to_upstream_sender,
-                                    upstream_to_channel_manager_receiver,
-                                    channel_manager_to_sv1_server_sender,
-                                    sv1_server_to_channel_manager_receiver,
-                                    self.config.supported_extensions.clone(),
-                                    self.config.required_extensions.clone(),
-                                    tproxy_mode,
-                                    #[cfg(feature = "monitoring")]
-                                    self.config.downstream_difficulty_config.enable_vardiff,
-                                ));
-
-                                if let Err(e) = self.initialize_upstream(
-                                    &mut upstream_addresses,
-                                    channel_manager_to_upstream_receiver,
-                                    upstream_to_channel_manager_sender,
-                                    cancellation_token.clone(),
-                                    fallback_coordinator.clone(),
-                                    task_manager.clone(),
-                                    sv1_server.clone(),
-                                    self.config.required_extensions.clone(),
-                                    channel_manager.clone(),
-                                )
-                                .await
-                                {
-                                    error!("Couldn't perform fallback, shutting system down: {e:?}");
-                                    cancellation_token.cancel();
-                                    break;
-                                }
-
-                                info!("Launching ChannelManager tasks...");
-                                ChannelManager::run_channel_manager_tasks(
-                                    channel_manager.clone(),
-                                    cancellation_token.clone(),
-                                    fallback_coordinator.clone(),
-                                    task_manager.clone(),
-                                )
-                                .await;
-
-                                // Recreate monitoring tasks with new components
-                                #[cfg(feature = "monitoring")]
-                                if let Some(monitoring_addr) = self.config.monitoring_address() {
-                                    info!("Reinitializing monitoring server on http://{monitoring_addr}");
-                                    if let Err(e) = self.start_monitoring_tasks(
-                                        monitoring_addr,
-                                        channel_manager.clone(),
-                                        sv1_server.clone(),
-                                        cancellation_token.clone(),
-                                        fallback_coordinator.clone(),
-                                        task_manager.clone(),
-                                    ) {
-                                        error!("Failed to reinitialize monitoring tasks: {e}");
-                                        cancellation_token.cancel();
-                                        break;
-                                    }
-                                }
-
-                                info!("Upstream and ChannelManager restarted successfully.");
+            match &recovery_trigger {
+                UpstreamRecoveryTrigger::ProtocolReconnect { requested_endpoint } => info!(
+                    "Preparing protocol-requested reconnect to {}:{}",
+                    requested_endpoint.host, requested_endpoint.port
+                ),
+                UpstreamRecoveryTrigger::ConfiguredFallback => {
+                    info!("Preparing configured upstream fallback")
                 }
             }
+
+            // FallbackCoordinator owns the shared teardown lifecycle, despite its historical name.
+            // It does not select the next endpoint: that policy remains explicit below and depends
+            // on recovery_trigger.
+            fallback_coordinator.trigger_fallback_and_wait().await;
+            info!("All upstream-dependent components finished recovery cleanup");
+
+            // Create a fresh lifecycle coordinator for the recovered components.
+            fallback_coordinator = FallbackCoordinator::new();
+            fallback_token = fallback_coordinator.token();
+
+            // Recreate channels and components closed during recovery teardown.
+            let (channel_manager_to_upstream_sender, channel_manager_to_upstream_receiver) =
+                unbounded();
+            let (upstream_to_channel_manager_sender, upstream_to_channel_manager_receiver) =
+                unbounded();
+            let (channel_manager_to_sv1_server_sender, channel_manager_to_sv1_server_receiver) =
+                unbounded();
+            let (sv1_server_to_channel_manager_sender, sv1_server_to_channel_manager_receiver) =
+                unbounded();
+
+            sv1_server = Arc::new(Sv1Server::new(
+                downstream_addr,
+                channel_manager_to_sv1_server_receiver,
+                sv1_server_to_channel_manager_sender,
+                self.config.clone(),
+                tproxy_mode,
+            ));
+
+            channel_manager = Arc::new(ChannelManager::new(
+                channel_manager_to_upstream_sender,
+                upstream_to_channel_manager_receiver,
+                channel_manager_to_sv1_server_sender,
+                sv1_server_to_channel_manager_receiver,
+                self.config.supported_extensions.clone(),
+                self.config.required_extensions.clone(),
+                tproxy_mode,
+                #[cfg(feature = "monitoring")]
+                self.config.downstream_difficulty_config.enable_vardiff,
+            ));
+
+            let initialization_result = match recovery_trigger {
+                UpstreamRecoveryTrigger::ProtocolReconnect { requested_endpoint } => {
+                    // A protocol-requested endpoint is a fresh, one-shot candidate. Configured-list
+                    // eligibility state is intentionally introduced only at this boundary.
+                    let mut requested_upstream = UpstreamEntry::from(requested_endpoint);
+                    let reconnect_result = self
+                        .initialize_upstream(
+                            std::slice::from_mut(&mut requested_upstream),
+                            channel_manager_to_upstream_receiver.clone(),
+                            upstream_to_channel_manager_sender.clone(),
+                            cancellation_token.clone(),
+                            fallback_coordinator.clone(),
+                            task_manager.clone(),
+                            sv1_server.clone(),
+                            self.config.required_extensions.clone(),
+                            channel_manager.clone(),
+                            protocol_reconnect_sender.clone(),
+                        )
+                        .await;
+
+                    if reconnect_result.is_ok() {
+                        reconnect_result
+                    } else {
+                        warn!(
+                            "Protocol-requested endpoint failed; trying configured fallback upstreams"
+                        );
+                        self.initialize_upstream(
+                            &mut upstream_addresses,
+                            channel_manager_to_upstream_receiver,
+                            upstream_to_channel_manager_sender,
+                            cancellation_token.clone(),
+                            fallback_coordinator.clone(),
+                            task_manager.clone(),
+                            sv1_server.clone(),
+                            self.config.required_extensions.clone(),
+                            channel_manager.clone(),
+                            protocol_reconnect_sender.clone(),
+                        )
+                        .await
+                    }
+                }
+                UpstreamRecoveryTrigger::ConfiguredFallback => {
+                    self.initialize_upstream(
+                        &mut upstream_addresses,
+                        channel_manager_to_upstream_receiver,
+                        upstream_to_channel_manager_sender,
+                        cancellation_token.clone(),
+                        fallback_coordinator.clone(),
+                        task_manager.clone(),
+                        sv1_server.clone(),
+                        self.config.required_extensions.clone(),
+                        channel_manager.clone(),
+                        protocol_reconnect_sender.clone(),
+                    )
+                    .await
+                }
+            };
+
+            if let Err(e) = initialization_result {
+                error!("Couldn't reconnect or perform fallback, shutting system down: {e:?}");
+                cancellation_token.cancel();
+                break;
+            }
+
+            info!("Launching ChannelManager tasks...");
+            ChannelManager::run_channel_manager_tasks(
+                channel_manager.clone(),
+                cancellation_token.clone(),
+                fallback_coordinator.clone(),
+                task_manager.clone(),
+            )
+            .await;
+
+            // Recreate monitoring tasks with new components.
+            #[cfg(feature = "monitoring")]
+            if let Some(monitoring_addr) = self.config.monitoring_address() {
+                info!("Reinitializing monitoring server on http://{monitoring_addr}");
+                if let Err(e) = self.start_monitoring_tasks(
+                    monitoring_addr,
+                    channel_manager.clone(),
+                    sv1_server.clone(),
+                    cancellation_token.clone(),
+                    fallback_coordinator.clone(),
+                    task_manager.clone(),
+                ) {
+                    error!("Failed to reinitialize monitoring tasks: {e}");
+                    cancellation_token.cancel();
+                    break;
+                }
+            }
+
+            info!("Upstream and ChannelManager restarted successfully.");
         }
 
         warn!(
@@ -441,6 +529,7 @@ impl TranslatorSv2 {
         sv1_server_instance: Arc<Sv1Server>,
         required_extensions: Vec<u16>,
         channel_manager_instance: Arc<ChannelManager>,
+        protocol_reconnect_sender: Sender<UpstreamEndpoint>,
     ) -> Result<(), TproxyErrorKind> {
         const MAX_RETRIES: usize = 3;
         let upstream_len = upstreams.len();
@@ -474,6 +563,7 @@ impl TranslatorSv2 {
                     task_manager.clone(),
                     required_extensions.clone(),
                     channel_manager_instance.negotiated_extensions.clone(),
+                    protocol_reconnect_sender.clone(),
                 )
                 .await
                 {
@@ -535,6 +625,7 @@ async fn try_initialize_upstream(
     task_manager: Arc<TaskManager>,
     required_extensions: Vec<u16>,
     negotiated_extensions: SharedLock<Vec<u16>>,
+    protocol_reconnect_sender: Sender<UpstreamEndpoint>,
 ) -> Result<(), TproxyErrorKind> {
     let upstream = Upstream::new(
         upstream_addr,
@@ -545,6 +636,7 @@ async fn try_initialize_upstream(
         task_manager.clone(),
         required_extensions,
         negotiated_extensions,
+        protocol_reconnect_sender,
     )
     .await?;
 

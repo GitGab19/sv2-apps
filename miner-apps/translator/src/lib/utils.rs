@@ -168,7 +168,7 @@ impl AtomicAggregatedState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UpstreamEntry {
     /// Upstream host — can be an IP address or a hostname (resolved at connection time).
     pub host: String,
@@ -176,6 +176,46 @@ pub struct UpstreamEntry {
     pub authority_pubkey: Secp256k1PublicKey,
     pub tried_or_flagged: bool,
     pub user_identity: String,
+}
+
+/// Connection details for one upstream, without configured-list eligibility state.
+///
+/// Protocol-requested reconnects carry this type so they cannot read or mutate
+/// [`UpstreamEntry::tried_or_flagged`]. That flag belongs exclusively to selection from the
+/// configured upstream list.
+#[derive(Debug, Clone)]
+pub struct UpstreamEndpoint {
+    /// Upstream host name or IP address.
+    pub host: String,
+    /// Upstream TCP port.
+    pub port: u16,
+    /// Authority key that must authenticate the upstream's Noise certificate.
+    pub authority_pubkey: Secp256k1PublicKey,
+    /// Pool identity used when opening mining channels through this endpoint.
+    pub user_identity: String,
+}
+
+impl From<&UpstreamEntry> for UpstreamEndpoint {
+    fn from(entry: &UpstreamEntry) -> Self {
+        Self {
+            host: entry.host.clone(),
+            port: entry.port,
+            authority_pubkey: entry.authority_pubkey,
+            user_identity: entry.user_identity.clone(),
+        }
+    }
+}
+
+impl From<UpstreamEndpoint> for UpstreamEntry {
+    fn from(endpoint: UpstreamEndpoint) -> Self {
+        Self {
+            host: endpoint.host,
+            port: endpoint.port,
+            authority_pubkey: endpoint.authority_pubkey,
+            tried_or_flagged: false,
+            user_identity: endpoint.user_identity,
+        }
+    }
 }
 
 /// Defines the operational mode for Translator Proxy.
@@ -317,6 +357,34 @@ pub(crate) fn tlv_user_identity_from_sv1_worker_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_endpoint_does_not_carry_configured_selection_state() {
+        let configured_entry = UpstreamEntry {
+            host: "pool.example".to_owned(),
+            port: 3333,
+            authority_pubkey: "9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan"
+                .parse()
+                .unwrap(),
+            tried_or_flagged: true,
+            user_identity: "account.worker".to_owned(),
+        };
+
+        let endpoint = UpstreamEndpoint::from(&configured_entry);
+        let reconnect_candidate = UpstreamEntry::from(endpoint);
+
+        assert_eq!(reconnect_candidate.host, configured_entry.host);
+        assert_eq!(reconnect_candidate.port, configured_entry.port);
+        assert_eq!(
+            reconnect_candidate.authority_pubkey.0,
+            configured_entry.authority_pubkey.0
+        );
+        assert_eq!(
+            reconnect_candidate.user_identity,
+            configured_entry.user_identity
+        );
+        assert!(!reconnect_candidate.tried_or_flagged);
+    }
 
     #[test]
     fn derives_sv1_worker_name_from_first_dot() {

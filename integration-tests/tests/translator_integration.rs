@@ -25,8 +25,8 @@ use std::{
 use stratum_apps::stratum_core::{
     binary_sv2::{Seq0255Owned, Sv2OptionOwned},
     common_messages_sv2::{
-        MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
-        MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS, Protocol, SetupConnectionErrorOwned,
+        MESSAGE_TYPE_RECONNECT, MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
+        MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS, Protocol, ReconnectOwned, SetupConnectionErrorOwned,
         SetupConnectionSuccessOwned,
     },
     mining_sv2::{
@@ -2641,6 +2641,164 @@ async fn test_translator_fallback_during_abrupt_disconnection() {
         )
         .await;
     shutdown_all!(translator, pool_2);
+}
+
+// A protocol Reconnect and a configured fallback share the same component teardown, but not the
+// same endpoint-selection policy. This verifies the protocol path rebuilds the translator against
+// the endpoint requested by the current pool.
+#[tokio::test]
+async fn translator_reconnects_to_protocol_requested_endpoint() {
+    start_tracing();
+
+    let current_upstream_addr = get_available_address();
+    let send_from_current_upstream = MockUpstream::new(
+        current_upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    let requested_upstream_addr = get_available_address();
+    let _requested_upstream = MockUpstream::new(
+        requested_upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+
+    let (current_sniffer, current_sniffer_addr) = start_sniffer(
+        "reconnect-current",
+        current_upstream_addr,
+        false,
+        vec![],
+        None,
+    );
+    let (requested_sniffer, requested_sniffer_addr) = start_sniffer(
+        "reconnect-requested",
+        requested_upstream_addr,
+        false,
+        vec![],
+        None,
+    );
+
+    let (translator, _, _) =
+        start_sv2_translator(&[current_sniffer_addr], false, vec![], vec![], None, false).await;
+
+    current_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+
+    send_from_current_upstream
+        .send(AnyMessageOwned::Common(CommonMessagesOwned::Reconnect(
+            ReconnectOwned {
+                new_host: requested_sniffer_addr.ip().to_string().try_into().unwrap(),
+                new_port: requested_sniffer_addr.port(),
+            },
+        )))
+        .await
+        .unwrap();
+
+    current_sniffer
+        .wait_for_message_type(MessageDirection::ToDownstream, MESSAGE_TYPE_RECONNECT)
+        .await;
+    requested_sniffer
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+    requested_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+
+    shutdown_all!(translator);
+}
+
+// If the endpoint supplied by Reconnect is unavailable, recovery must continue through the
+// configured fallback list. Whether previously successful configured entries remain eligible on
+// later recovery cycles is a separate initialize_upstream state policy.
+#[tokio::test]
+async fn translator_uses_configured_fallback_when_requested_reconnect_fails() {
+    start_tracing();
+
+    let current_upstream_addr = get_available_address();
+    let send_from_current_upstream = MockUpstream::new(
+        current_upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+    let fallback_upstream_addr = get_available_address();
+    let _fallback_upstream = MockUpstream::new(
+        fallback_upstream_addr,
+        WithSetup::yes_with_defaults(Protocol::MiningProtocol, 0),
+    )
+    .start()
+    .await;
+
+    let (current_sniffer, current_sniffer_addr) = start_sniffer(
+        "reconnect-failure-current",
+        current_upstream_addr,
+        false,
+        vec![],
+        None,
+    );
+    let (fallback_sniffer, fallback_sniffer_addr) = start_sniffer(
+        "reconnect-failure-fallback",
+        fallback_upstream_addr,
+        false,
+        vec![],
+        None,
+    );
+    let unavailable_upstream_addr = get_available_address();
+
+    let (translator, _, _) = start_sv2_translator(
+        &[current_sniffer_addr, fallback_sniffer_addr],
+        false,
+        vec![],
+        vec![],
+        None,
+        false,
+    )
+    .await;
+
+    current_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+
+    send_from_current_upstream
+        .send(AnyMessageOwned::Common(CommonMessagesOwned::Reconnect(
+            ReconnectOwned {
+                new_host: unavailable_upstream_addr
+                    .ip()
+                    .to_string()
+                    .try_into()
+                    .unwrap(),
+                new_port: unavailable_upstream_addr.port(),
+            },
+        )))
+        .await
+        .unwrap();
+
+    current_sniffer
+        .wait_for_message_type(MessageDirection::ToDownstream, MESSAGE_TYPE_RECONNECT)
+        .await;
+    fallback_sniffer
+        .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
+        .await;
+    fallback_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToDownstream,
+            MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        )
+        .await;
+
+    shutdown_all!(translator);
 }
 
 #[tokio::test]

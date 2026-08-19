@@ -205,6 +205,8 @@ pub enum TproxyErrorKind {
     TlvError(parsers_sv2::TlvError),
     /// Setup connection error
     SetupConnectionError,
+    /// Reconnect host is not valid UTF-8
+    InvalidReconnectHost,
     /// Open mining channel error
     OpenMiningChannelError,
     /// Could not initiate subsystem
@@ -288,6 +290,7 @@ impl fmt::Display for TproxyErrorKind {
             TlvError(e) => write!(f, "TLV error: {e:?}"),
             OpenMiningChannelError => write!(f, "failed to open mining channel"),
             SetupConnectionError => write!(f, "failed to setup connection with upstream"),
+            InvalidReconnectHost => write!(f, "upstream requested an invalid reconnect host"),
             CouldNotInitiateSystem => write!(f, "Could not initiate subsystem"),
             DownstreamNotFoundWithChannelId(channel_id) => {
                 write!(f, "Downstream not found with channel id: {channel_id}")
