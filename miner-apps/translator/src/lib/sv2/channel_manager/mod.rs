@@ -7,7 +7,8 @@ use crate::{
     error::{self, Action, LoopControl, TproxyError, TproxyErrorKind, TproxyResult},
     utils::{
         AGGREGATED_CHANNEL_ID, AggregatedState, AtomicAggregatedState,
-        aggregated_upstream_user_identity, tlv_user_identity_from_sv1_worker_name,
+        aggregated_upstream_user_identity, channel_label, format_hashrate,
+        tlv_user_identity_from_sv1_worker_name,
     },
 };
 use async_channel::{Receiver, Sender};
@@ -50,7 +51,7 @@ use stratum_apps::{
 };
 
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Maximum number of concurrent downstream channels managed by the
 /// aggregated-mode shared [`ExtranonceAllocator`]. Determines
@@ -107,7 +108,6 @@ impl ChannelManagerIo {
     }
 
     fn close(&self) {
-        debug!("Dropping channel manager channels");
         self.upstream_sender.close();
         self.sv1_server_sender.close();
         self.upstream_receiver.close_and_drain();
@@ -313,10 +313,7 @@ impl ChannelManager {
                     }))
                     .await
                     .map_err(|error| {
-                        error!(
-                            channel_id,
-                            "Failed to queue job extranonce prefix for SV1 server: {error:?}"
-                        );
+                        debug!(error = ?error, channel_id, "Failed to forward message (channel closed)");
                         TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
                     })?;
                 self.sv1_advertised_extranonce_prefixes
@@ -329,7 +326,7 @@ impl ChannelManager {
             .send(MiningOwned::NewExtendedMiningJob(message))
             .await
             .map_err(|error| {
-                error!("Failed to queue NewExtendedMiningJob for SV1 server: {error:?}");
+                debug!(error = ?error, "Failed to forward message (channel closed)");
                 TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
             })
     }
@@ -355,7 +352,7 @@ impl ChannelManager {
             ))
             .await
             .map_err(|e| {
-                error!("Failed to send open channel error to SV1Server: {e:?}");
+                debug!(error = ?e, "Failed to forward message (channel closed)");
                 TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
             })
     }
@@ -404,8 +401,9 @@ impl ChannelManager {
                 LoopControl::Continue
             }
             // Only the upstream can request a reconnect; anywhere else it means a fallback.
+            // Every cause of a fallback here logs why before returning it.
             Action::Fallback | Action::Reconnect => {
-                warn!(
+                debug!(
                     error_kind = ?e.kind,
                     "{context} requested fallback"
                 );
@@ -462,8 +460,8 @@ impl ChannelManager {
         // default, so it appears nowhere in this application's own config and is
         // otherwise not recoverable from a running instance.
         match max_past_jobs {
-            Some(n) if n > 0 => info!(max_past_jobs = n, "past-jobs retention cap configured"),
-            _ => info!("past-jobs retention cap: using channels_sv2 default"),
+            Some(n) if n > 0 => debug!(max_past_jobs = n, "past-jobs retention cap configured"),
+            _ => debug!("past-jobs retention cap: using channels_sv2 default"),
         }
 
         let channel_manager_io = ChannelManagerIo::new(
@@ -522,14 +520,8 @@ impl ChannelManager {
             loop {
                 tokio::select! {
                     biased;
-                    _ = cancellation_token.cancelled() => {
-                        info!("ChannelManager: received shutdown signal");
-                        break;
-                    }
-                    _ = fallback_token.cancelled() => {
-                        info!("ChannelManager: fallback triggered");
-                        break;
-                    }
+                    _ = cancellation_token.cancelled() => break,
+                    _ = fallback_token.cancelled() => break,
                     res = self.clone().handle_upstream_frame() => {
                         if let Err(e) = res {
                             if let LoopControl::Break = self.handle_error_action(
@@ -555,14 +547,14 @@ impl ChannelManager {
                         }
                     },
                     else => {
-                        warn!("All channel manager message streams closed. Exiting...");
+                        debug!("All channel manager message streams closed, exiting");
                         break;
                     }
                 }
             }
 
             self.channel_manager_io.close();
-            warn!("ChannelManager: unified message loop exited.");
+            debug!("Channel manager stopped");
         }));
     }
 
@@ -718,7 +710,7 @@ impl ChannelManager {
                     self.pending_downstream_channels.insert(
                         open_channel_msg.request_id as DownstreamId,
                         PendingChannelRequest {
-                            user_identity,
+                            user_identity: user_identity.clone(),
                             nominal_hashrate: hashrate,
                             min_extranonce_size,
                             max_target,
@@ -726,12 +718,8 @@ impl ChannelManager {
                     );
                 }
 
-                info!(
-                    "Sending OpenExtendedMiningChannel message to upstream: {:?}",
-                    open_channel_msg
-                );
-
                 let message = MiningOwned::OpenExtendedMiningChannel(open_channel_msg);
+                debug!("Sending to SV2 server: {message}");
                 let sv2_frame = OutboundFrame::from_message(AnyMessageOwned::Mining(message))
                     .map_err(TproxyError::shutdown)?;
                 self.channel_manager_io
@@ -739,7 +727,7 @@ impl ChannelManager {
                     .send(sv2_frame)
                     .await
                     .map_err(|e| {
-                        error!("Failed to send open channel message to upstream: {:?}", e);
+                        debug!(error = ?e, "Failed to forward message (channel closed)");
                         TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
                     })?;
             }
@@ -784,11 +772,6 @@ impl ChannelManager {
                         });
                     match value {
                         Some(Ok(_result)) => {
-                            info!(
-                                "SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {} ☑️",
-                                upstream_extended_channel_id, m.sequence_number
-                            );
-
                             // In aggregated mode, use a single sequence counter for all valid
                             // shares.
                             m.sequence_number =
@@ -829,10 +812,6 @@ impl ChannelManager {
                         });
                     match value {
                         Some(Ok(_result)) => {
-                            info!(
-                                "SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {} ☑️",
-                                m.channel_id, m.sequence_number
-                            );
                             // In non-aggregated mode, each downstream channel has its own sequence
                             // counter.
                             m.sequence_number = self.next_share_sequence_number(m.channel_id);
@@ -884,6 +863,16 @@ impl ChannelManager {
                     }
                 }
 
+                match sv1_worker_name.as_deref().filter(|name| !name.is_empty()) {
+                    Some(name) => info!(
+                        "Share from {name} sent to the SV2 server on SV2 channel {}",
+                        m.channel_id
+                    ),
+                    None => info!(
+                        "Share sent to the SV2 server on SV2 channel {}",
+                        m.channel_id
+                    ),
+                }
                 // Send the share upstream (common for both aggregated and non-aggregated modes)
                 let contains_type_in_negotiated_extension = self
                     .negotiated_extensions
@@ -899,9 +888,13 @@ impl ChannelManager {
                         let tlv_user_identity =
                             tlv_user_identity_from_sv1_worker_name(sv1_worker_name)
                                 .map_err(TproxyError::shutdown)?;
+                        debug!(
+                            "Sending to SV2 server: {m} with worker name {}",
+                            tlv_user_identity.as_string_or_hex()
+                        );
                         let tlv = tlv_user_identity.to_tlv().map_err(TproxyError::shutdown)?;
                         let tlv_list = TlvList::from_slice(&[tlv]).map_err(|e| {
-                            error!("Failed to create TLV list: {:?}", e);
+                            error!(error = ?e, "Failed to create TLV list");
                             TproxyError::shutdown(e)
                         })?;
                         let frame_bytes = tlv_list
@@ -909,13 +902,13 @@ impl ChannelManager {
                                 m.clone(),
                             ))
                             .map_err(|e| {
-                                error!("Failed to build frame bytes with TLVs: {:?}", e);
+                                error!(error = ?e, "Failed to build frame bytes with TLVs");
                                 TproxyError::shutdown(e)
                             })?;
                         // The TLV bytes are already framed, so they go out as a raw frame.
                         let sv2_frame =
                             InboundFrame::from_bytes(frame_bytes.into()).map_err(|missing| {
-                                error!("Failed to frame the TLV bytes: {missing}");
+                                error!(error = ?missing, "Failed to frame TLV bytes");
                                 TproxyError::shutdown(TproxyErrorKind::UnexpectedMessage(0, 0))
                             })?;
                         self.channel_manager_io
@@ -923,10 +916,7 @@ impl ChannelManager {
                             .send(sv2_frame.into())
                             .await
                             .map_err(|e| {
-                                error!(
-                                    "Failed to send submit shares extended message to upstream: {:?}",
-                                    e
-                                );
+                                debug!(error = ?e, "Failed to forward message (channel closed)");
                                 TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
                             })?;
                         sent = true;
@@ -935,6 +925,7 @@ impl ChannelManager {
 
                 if !sent {
                     let message = MiningOwned::SubmitSharesExtended(m);
+                    debug!("Sending to SV2 server: {message}");
                     let sv2_frame = OutboundFrame::from_message(AnyMessageOwned::Mining(message))
                         .map_err(TproxyError::shutdown)?;
                     self.channel_manager_io
@@ -942,16 +933,21 @@ impl ChannelManager {
                         .send(sv2_frame)
                         .await
                         .map_err(|e| {
-                            error!(
-                                "Failed to send submit shares extended message to upstream: {:?}",
-                                e
-                            );
+                            debug!(error = ?e, "Failed to forward message (channel closed)");
                             TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
                         })?;
                 }
             }
             MiningOwned::UpdateChannel(mut m) => {
-                debug!("Received UpdateChannel from SV1Server: {}", m);
+                trace!(
+                    "SV1 server -> channel manager: UpdateChannel for {}, {}",
+                    if self.mode.is_aggregated() {
+                        channel_label(AGGREGATED_CHANNEL_ID)
+                    } else {
+                        channel_label(m.channel_id)
+                    },
+                    format_hashrate(m.nominal_hash_rate)
+                );
 
                 if self.mode.is_aggregated() {
                     // Update the aggregated channel's nominal hashrate so
@@ -967,8 +963,8 @@ impl ChannelManager {
                         m.channel_id = channel_id;
                     } else {
                         warn!(
-                            "Ignoring aggregated UpdateChannel before upstream channel is open: {:?}",
-                            m
+                            channel_id = m.channel_id,
+                            "Ignoring aggregated UpdateChannel before upstream channel is open"
                         );
                         return Ok(());
                     }
@@ -990,12 +986,9 @@ impl ChannelManager {
                     )
                 });
 
-                info!(
-                    "Sending UpdateChannel message to upstream for channel_id: {}",
-                    m.channel_id
-                );
                 // Forward UpdateChannel message to upstream
                 let message = MiningOwned::UpdateChannel(m);
+                debug!("Sending to SV2 server: {message}");
                 let sv2_frame = OutboundFrame::from_message(AnyMessageOwned::Mining(message))
                     .map_err(TproxyError::shutdown)?;
 
@@ -1004,12 +997,15 @@ impl ChannelManager {
                     .send(sv2_frame)
                     .await
                     .map_err(|e| {
-                        error!("Failed to send UpdateChannel message to upstream: {:?}", e);
+                        debug!(error = ?e, "Failed to forward message (channel closed)");
                         TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
                     })?;
             }
             MiningOwned::CloseChannel(m) => {
-                debug!("Received CloseChannel from Sv1Server: {m}");
+                trace!(
+                    "SV1 server -> channel manager: CloseChannel for {}",
+                    channel_label(m.channel_id)
+                );
 
                 // Guard: never remove the aggregated upstream sentinel entry
                 // here. `AGGREGATED_CHANNEL_ID` represents the single shared
@@ -1032,11 +1028,11 @@ impl ChannelManager {
                 //   on that one slot), so the prefix's `Weak` reference fails to upgrade and there
                 //   is nothing to clear.
                 if self.extended_channels.remove(&m.channel_id).is_some() {
-                    debug!("Removed channel {} from extended_channels", m.channel_id);
+                    trace!("Removed channel {} from extended_channels", m.channel_id);
                 } else {
                     warn!(
-                        "Attempted to remove channel {} from extended_channels but it was not found",
-                        m.channel_id
+                        channel_id = m.channel_id,
+                        "Attempted to remove channel from extended_channels but it was not found"
                     );
                 }
                 self.sv1_advertised_extranonce_prefixes
@@ -1059,6 +1055,7 @@ impl ChannelManager {
                 // them disconnects.
                 if !self.mode.is_aggregated() {
                     let message = MiningOwned::CloseChannel(m);
+                    debug!("Sending to SV2 server: {message}");
                     let sv2_frame = OutboundFrame::from_message(AnyMessageOwned::Mining(message))
                         .map_err(TproxyError::shutdown)?;
 
@@ -1067,13 +1064,13 @@ impl ChannelManager {
                         .send(sv2_frame)
                         .await
                         .map_err(|e| {
-                            error!("Failed to send CloseChannel message to upstream: {:?}", e);
+                            debug!(error = ?e, "Failed to forward message (channel closed)");
                             TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
                         })?;
                 }
             }
             _ => {
-                warn!("Unhandled downstream message: {}", message);
+                warn!(message = %message, "Unhandled downstream message");
             }
         }
 
@@ -1193,8 +1190,8 @@ impl ChannelManager {
                     // the target is the aggregated channel's own, validated when it was
                     // installed, so this only fails on an internal inconsistency
                     error!(
-                        "Aggregated channel holds a target no share can meet: {:?}",
-                        e
+                        error = ?e,
+                        "Aggregated channel holds a target no share can meet"
                     );
                     TproxyError::shutdown(TproxyErrorKind::OpenMiningChannelError)
                 })?;
@@ -1272,7 +1269,7 @@ impl ChannelManager {
                     .send(success_message)
                     .await
                     .map_err(|e| {
-                        error!("Failed to send open channel message to SV1Server: {:?}", e);
+                        debug!(error = ?e, "Failed to forward message (channel closed)");
                         TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
                     })?;
                 self.sv1_advertised_extranonce_prefixes
@@ -1318,13 +1315,6 @@ impl ChannelManager {
                 ));
             });
         self.pending_downstream_channels.clear();
-        if !pending_requests.is_empty() {
-            info!(
-                count = pending_requests.len(),
-                "Opening buffered aggregated downstream channel requests"
-            );
-        }
-
         for (request_id, user_identity, hashrate, min_extranonce_size) in pending_requests {
             self.handle_downstream_channel_request_in_aggregated_mode(
                 request_id,
@@ -1400,7 +1390,7 @@ impl ChannelManager {
             .for_each_mut(|group_channel_id, group_channel| {
                 if group_channel.has_channel_id(channel_id) {
                     group_channel.remove_channel_id(channel_id);
-                    debug!("Removed channel {channel_id} from group channel {group_channel_id}");
+                    trace!("Removed channel {channel_id} from group channel {group_channel_id}");
                     if group_channel.is_empty() {
                         emptied_groups.push(group_channel_id);
                     }
@@ -1415,7 +1405,7 @@ impl ChannelManager {
                 })
                 .is_some()
             {
-                debug!("Removed empty group channel {group_channel_id}");
+                trace!("Removed empty group channel {group_channel_id}");
             }
         }
     }

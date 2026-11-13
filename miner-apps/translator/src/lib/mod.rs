@@ -17,7 +17,7 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, info};
 
 pub use stratum_apps::stratum_core::sv1_api::server_to_client;
 
@@ -61,6 +61,28 @@ impl TranslatorSv2 {
         }
     }
 
+    /// Describes, for the startup log, how SV1 clients are mapped onto SV2 channels and how their
+    /// difficulty is set.
+    fn mode_description(&self) -> String {
+        let channels = if self.config.aggregate_channels {
+            "Aggregating all SV1 clients into one SV2 channel"
+        } else {
+            "Opening one SV2 channel per SV1 client"
+        };
+        let difficulty = &self.config.downstream_difficulty_config;
+        let start = utils::format_hashrate(difficulty.min_individual_miner_hashrate);
+        if difficulty.enable_vardiff {
+            format!(
+                "{channels}; new SV1 clients start at {start}, vardiff targets {} shares/min",
+                difficulty.shares_per_minute
+            )
+        } else {
+            format!(
+                "{channels}; new SV1 clients start at {start}, then follow the SV2 server's target (vardiff disabled)"
+            )
+        }
+    }
+
     /// Marks the Translator Proxy as stopped and releases anyone blocked on
     /// [`TranslatorSv2::shutdown`].
     ///
@@ -82,8 +104,12 @@ impl TranslatorSv2 {
     ///    and handles fallbacks or graceful shutdown.
     /// 4. **Teardown:** Performs a coordinated graceful cleanup of all services and tasks upon
     ///    termination.
+    ///
+    /// Every startup or reconnect failure logs its cause where it happens, so the errors returned
+    /// here are only logged at debug level.
     pub async fn start(&self) -> Result<(), TproxyErrorKind> {
-        info!("Starting Translator Proxy...");
+        info!("Starting Translator Proxy");
+        info!("{}", self.mode_description());
 
         let runtime = match TranslatorRuntime::<Init>::new(self.clone()) {
             Ok(runtime) => runtime,
@@ -97,7 +123,7 @@ impl TranslatorSv2 {
             Ok(running) => running,
             Err(bootstrap_err) => {
                 let (kind, runtime) = bootstrap_err.into_parts();
-                error!(?kind, "Failed to bootstrap Translator Proxy");
+                debug!(error = ?kind, "Failed to bootstrap Translator Proxy");
                 runtime.shutdown().await;
                 return Err(kind);
             }
@@ -126,14 +152,14 @@ impl TranslatorSv2 {
                     Ok(running) => running,
                     Err(bootstrap_err) => {
                         let (kind, runtime) = bootstrap_err.into_parts();
-                        error!(?kind, "Failed to start services for Translator Proxy");
+                        debug!(error = ?kind, "Failed to start services for Translator Proxy");
                         runtime.shutdown().await;
                         return Err(kind);
                     }
                 },
                 Err(bootstrap_err) => {
                     let (kind, runtime) = bootstrap_err.into_parts();
-                    error!(?kind, "Failed to reconnect Translator Proxy");
+                    debug!(error = ?kind, "Failed to reconnect Translator Proxy");
                     runtime.shutdown().await;
                     return Err(kind);
                 }
@@ -155,7 +181,6 @@ impl TranslatorSv2 {
 
 impl Drop for TranslatorSv2 {
     fn drop(&mut self) {
-        info!("TranslatorSv2 dropped");
         self.cancellation_token.cancel();
     }
 }

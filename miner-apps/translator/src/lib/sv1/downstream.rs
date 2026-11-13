@@ -1,18 +1,18 @@
 use crate::{
     error::{self, Action, LoopControl, TproxyError, TproxyErrorKind, TproxyResult},
     sv1::job_store::Sv1JobStore,
-    utils::SubmitShareWithChannelId,
+    utils::{SubmitShareWithChannelId, sv1_message_json},
 };
 use async_channel::{Receiver, Sender};
 #[cfg(feature = "monitoring")]
 use std::net::IpAddr;
-use std::{collections::VecDeque, future::Future, sync::Arc, time::Instant};
+use std::{collections::VecDeque, future::Future, net::SocketAddr, sync::Arc, time::Instant};
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
     fallback_coordinator::FallbackCoordinator,
     stratum_core::{
         bitcoin::{BlockHash, Target},
-        channels_sv2::client::MAX_SEEN_SHARES,
+        channels_sv2::{client::MAX_SEEN_SHARES, target::bytes_to_hex},
         sv1_api::{
             json_rpc,
             methods::Client2Server,
@@ -25,7 +25,7 @@ use stratum_apps::{
     utils::types::{ChannelId, DownstreamId, Hashrate},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// tProxy-local work queued by the SV1 server for a single downstream task.
 ///
@@ -85,7 +85,6 @@ impl DownstreamIo {
     }
 
     fn close(&self) {
-        debug!("Dropping downstream channel state");
         self.downstream_sv1_sender.close();
         self.downstream_sv1_receiver.close_and_drain();
         self.sv1_server_receiver.close_and_drain();
@@ -207,6 +206,8 @@ pub struct DownstreamData {
     /// Hashrate estimate of the miner: the latest vardiff estimate, or with vardiff disabled the
     /// hashrate its upstream target implies.
     pub hashrate: Option<Hashrate>,
+    /// Address the SV1 client connected from.
+    pub peer_addr: SocketAddr,
     #[cfg(feature = "monitoring")]
     pub connection_ip: IpAddr,
     pub version_rolling_mask: Option<HexU32Be>,
@@ -257,7 +258,7 @@ impl DownstreamData {
         hashrate: Option<Hashrate>,
         target: Target,
         max_past_jobs: Option<usize>,
-        #[cfg(feature = "monitoring")] connection_ip: IpAddr,
+        peer_addr: SocketAddr,
     ) -> Self {
         DownstreamData {
             channel_id: None,
@@ -267,8 +268,9 @@ impl DownstreamData {
             extranonce2_len: 4,
             target,
             hashrate,
+            peer_addr,
             #[cfg(feature = "monitoring")]
-            connection_ip,
+            connection_ip: peer_addr.ip(),
             version_rolling_mask: None,
             version_rolling_min_bit: None,
             sv1_username: String::new(),
@@ -288,6 +290,15 @@ impl DownstreamData {
             upstream_target: None,
             keepalive_timer_anchor: None,
             supports_set_extranonce: false,
+        }
+    }
+
+    /// Names the SV1 client in log lines: its worker name once authorized, its address before.
+    pub(super) fn client_name(&self) -> String {
+        if self.sv1_worker_name.is_empty() {
+            self.peer_addr.to_string()
+        } else {
+            self.sv1_worker_name.clone()
         }
     }
 
@@ -313,9 +324,9 @@ impl DownstreamData {
 
     pub fn set_upstream_target(&mut self, upstream_target: Target, downstream_id: DownstreamId) {
         self.upstream_target = Some(upstream_target);
-        debug!(
-            "Downstream {downstream_id}: Set upstream target to {}",
-            upstream_target
+        trace!(
+            "SV1 client {downstream_id}: SV2 channel target set to {}",
+            bytes_to_hex(&upstream_target.to_be_bytes())
         );
     }
 }
@@ -432,15 +443,14 @@ impl Downstream {
         target: Target,
         hashrate: Option<Hashrate>,
         max_past_jobs: Option<usize>,
-        #[cfg(feature = "monitoring")] connection_ip: IpAddr,
+        peer_addr: SocketAddr,
         downstream_cancellation_token: CancellationToken,
     ) -> Self {
         let downstream_data = SharedLock::new(DownstreamData::new(
             hashrate,
             target,
             max_past_jobs,
-            #[cfg(feature = "monitoring")]
-            connection_ip,
+            peer_addr,
         ));
         let downstream_channel_io = DownstreamIo::new(
             downstream_sv1_sender,
@@ -464,9 +474,10 @@ impl Downstream {
     /// - Messages from the miner (subscribe, authorize, submit)
     /// - Messages from the SV1 server (notify, set_difficulty, etc.)
     ///
-    /// The task will continue running until a cancellation signal is received or
-    /// an unrecoverable error occurs. It ensures graceful cleanup of resources
-    /// and proper error reporting.
+    /// The task will continue running until a cancellation signal is received, the client's
+    /// connection closes, or an unrecoverable error occurs. `on_disconnect` runs only when the
+    /// client leaves on its own: a shutdown or fallback tears down the SV1 server together with
+    /// every client's state.
     pub(super) fn start<F, Fut>(
         self,
         cancellation_token: CancellationToken,
@@ -483,55 +494,46 @@ impl Downstream {
             loop {
                 tokio::select! {
                     biased;
-                    _ = cancellation_token.cancelled() => {
-                        info!("Downstream {downstream_id}: received app shutdown signal");
-                        break;
-                    }
-                    _ = fallback_token.cancelled() => {
-                        info!("Downstream {downstream_id}: fallback triggered");
-                        break;
-                    }
+                    _ = cancellation_token.cancelled() => break,
+                    _ = fallback_token.cancelled() => break,
                     // Handle downstream -> server message
                     res = self.handle_downstream_message() => {
-                        if let Err(e) = res {
-                            error!("Downstream {downstream_id}: error in downstream message handler: {e:?}");
-                            if let LoopControl::Break = self.handle_error_action(
-                                "Downstream::handle_downstream_message",
-                                &e,
-                                &cancellation_token,
-                                &fallback_token,
-                            ) {
-                                break;
-                            }
+                        let control = res.unwrap_or_else(|e| self.handle_error_action(
+                            "Downstream::handle_downstream_message",
+                            &e,
+                            &cancellation_token,
+                            &fallback_token,
+                        ));
+                        if let LoopControl::Break = control {
+                            break;
                         }
                     }
 
                     // Handle server -> downstream message
                     res = self.handle_sv1_server_message() => {
-                        if let Err(e) = res {
-                            error!("Downstream {downstream_id}: error in server message handler: {e:?}");
-                            if let LoopControl::Break = self.handle_error_action(
-                                "Downstream::handle_sv1_server_message",
-                                &e,
-                                &cancellation_token,
-                                &fallback_token,
-                            ) {
-                                break;
-                            }
+                        let control = res.unwrap_or_else(|e| self.handle_error_action(
+                            "Downstream::handle_sv1_server_message",
+                            &e,
+                            &cancellation_token,
+                            &fallback_token,
+                        ));
+                        if let LoopControl::Break = control {
+                            break;
                         }
                     }
 
                     else => {
-                        warn!("Downstream {downstream_id}: all channels closed; exiting task");
+                        debug!(downstream_id, "All channels closed; exiting downstream task");
                         break;
                     }
                 }
             }
 
-            warn!("Downstream {downstream_id}: unified task shutting down");
             self.downstream_cancellation_token.cancel();
             self.downstream_io.close();
-            on_disconnect().await;
+            if !cancellation_token.is_cancelled() && !fallback_token.is_cancelled() {
+                on_disconnect().await;
+            }
         }));
     }
 
@@ -539,13 +541,18 @@ impl Downstream {
     ///
     /// Jobs wait for subscribe and authorize responses. Difficulty and extranonce changes are
     /// sent with the next deliverable job; prefix support is required only at that boundary.
-    pub(super) async fn handle_sv1_server_message(&self) -> TproxyResult<(), error::Downstream> {
-        let event = self
-            .downstream_io
-            .sv1_server_receiver
-            .recv()
-            .await
-            .map_err(|error| TproxyError::disconnect(error, self.downstream_id))?;
+    ///
+    /// Returns [`LoopControl::Break`] once the SV1 server closes this client's event channel.
+    pub(super) async fn handle_sv1_server_message(
+        &self,
+    ) -> TproxyResult<LoopControl, error::Downstream> {
+        let Ok(event) = self.downstream_io.sv1_server_receiver.recv().await else {
+            debug!(
+                "SV1 client {}: the SV1 server closed its event channel",
+                self.downstream_id
+            );
+            return Ok(LoopControl::Break);
+        };
         match event {
             Sv1ServerEvent::SetupComplete => self.enable_notification_forwarding().await?,
             Sv1ServerEvent::SetDifficulty(difficulty) => {
@@ -591,7 +598,7 @@ impl Downstream {
                     .map_err(TproxyError::shutdown)?;
             }
         }
-        Ok(())
+        Ok(LoopControl::Continue)
     }
 
     /// Handles messages received from the downstream SV1 miner.
@@ -606,14 +613,14 @@ impl Downstream {
     /// which implements the SV1 protocol logic and generates appropriate responses.
     /// Responses are sent back to the miner, while share submissions are forwarded
     /// to the SV1 server for upstream processing.
-    async fn handle_downstream_message(&self) -> TproxyResult<(), error::Downstream> {
+    ///
+    /// Returns [`LoopControl::Break`] once the SV1 connection closes, because the client hung up
+    /// or tProxy disconnected it.
+    async fn handle_downstream_message(&self) -> TproxyResult<LoopControl, error::Downstream> {
         let downstream_id = self.downstream_id;
-        let message = match self.downstream_io.downstream_sv1_receiver.recv().await {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!("Error receiving downstream message: {:?}", e);
-                return Err(TproxyError::disconnect(e, downstream_id));
-            }
+        let Ok(message) = self.downstream_io.downstream_sv1_receiver.recv().await else {
+            debug!("SV1 client {downstream_id}: connection closed");
+            return Ok(LoopControl::Break);
         };
 
         self.downstream_io
@@ -622,7 +629,7 @@ impl Downstream {
             .await
             .map_err(|_| TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender))?;
 
-        Ok(())
+        Ok(LoopControl::Continue)
     }
 
     /// Releases the latest cached job once both setup responses have been queued.
@@ -644,9 +651,18 @@ impl Downstream {
         if let Some(notify) = notify {
             self.send_job(notify).await?;
         }
-        self.downstream_data
-            .with(|data| data.session_state = Sv1SessionState::Ready)
+        let (worker_name, peer_addr) = self
+            .downstream_data
+            .with(|data| {
+                data.session_state = Sv1SessionState::Ready;
+                (data.sv1_worker_name.clone(), data.peer_addr)
+            })
             .map_err(TproxyError::shutdown)?;
+        if worker_name.is_empty() {
+            info!("SV1 handshake completed with {peer_addr}");
+        } else {
+            info!("SV1 handshake completed with {worker_name} ({peer_addr})");
+        }
         Ok(())
     }
 
@@ -673,29 +689,49 @@ impl Downstream {
             })
             .map_err(TproxyError::shutdown)?;
         let Some((difficulty, extranonce)) = messages else {
+            let name = self
+                .downstream_data
+                .with(|data| data.client_name())
+                .map_err(TproxyError::shutdown)?;
             warn!(
-                downstream_id = self.downstream_id,
-                "Disconnecting SV1 miner before a job requiring unannounced mining.set_extranonce support"
+                "SV1 client {name} does not support mining.set_extranonce, which the SV2 server's new extranonce requires; disconnecting it"
             );
             self.disconnect();
             return Ok(());
         };
-        for message in [
-            difficulty,
-            extranonce.map(json_rpc::Message::from),
-            Some(json_rpc::Message::from((*notify).clone())),
-        ]
-        .into_iter()
-        .flatten()
+        let difficulty_and_extranonce = [difficulty, extranonce.map(json_rpc::Message::from)];
+        for message in difficulty_and_extranonce.iter().flatten() {
+            debug!(
+                "Sending to SV1 client {}: {}",
+                self.downstream_id,
+                sv1_message_json(message)
+            );
+        }
+        // The job's contents are in the job received from the SV2 server, so it is named by id.
+        debug!(
+            "Sending to SV1 client {}: mining.notify for job {} (clean_jobs: {})",
+            self.downstream_id, notify.job_id, notify.clean_jobs
+        );
+        for message in difficulty_and_extranonce
+            .into_iter()
+            .flatten()
+            .chain(Some(json_rpc::Message::from((*notify).clone())))
         {
-            self.downstream_io
+            // The SV1 connection closes its incoming and outgoing channels together, so the
+            // receiving side ends this task.
+            if self
+                .downstream_io
                 .downstream_sv1_sender
                 .send(message)
                 .await
-                .map_err(|error| {
-                    error!("Down: Failed to send mining job messages: {error:?}");
-                    TproxyError::disconnect(TproxyErrorKind::ChannelErrorSender, self.downstream_id)
-                })?;
+                .is_err()
+            {
+                debug!(
+                    "SV1 client {}: connection closed, dropping job",
+                    self.downstream_id
+                );
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -812,8 +848,7 @@ mod tests {
             old_target,
             None,
             None,
-            #[cfg(feature = "monitoring")]
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             CancellationToken::new(),
         );
 
@@ -858,8 +893,7 @@ mod tests {
             Target::from_le_bytes([0x11; 32]),
             None,
             None,
-            #[cfg(feature = "monitoring")]
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             CancellationToken::new(),
         );
         let queued_notify = notify("queued");
@@ -914,8 +948,7 @@ mod tests {
             Target::from_le_bytes([0x11; 32]),
             None,
             None,
-            #[cfg(feature = "monitoring")]
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             CancellationToken::new(),
         );
         let queued_difficulty = difficulty(Target::from_le_bytes([0x11; 32]));
@@ -988,8 +1021,7 @@ mod tests {
             old_target,
             None,
             None,
-            #[cfg(feature = "monitoring")]
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             CancellationToken::new(),
         );
         downstream
@@ -1075,8 +1107,7 @@ mod tests {
             Target::from_le_bytes([0x11; 32]),
             None,
             None,
-            #[cfg(feature = "monitoring")]
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             CancellationToken::new(),
         );
         let old_extranonce = downstream
@@ -1152,8 +1183,7 @@ mod tests {
             Target::from_le_bytes([0x11; 32]),
             None,
             None,
-            #[cfg(feature = "monitoring")]
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             CancellationToken::new(),
         );
         downstream
@@ -1252,8 +1282,7 @@ mod tests {
             Target::from_le_bytes([0x11; 32]),
             None,
             None,
-            #[cfg(feature = "monitoring")]
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             CancellationToken::new(),
         );
         downstream
@@ -1330,8 +1359,7 @@ mod tests {
             Target::from_le_bytes([0x11; 32]),
             None,
             None,
-            #[cfg(feature = "monitoring")]
-            "127.0.0.1".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
             CancellationToken::new(),
         );
         let new_extranonce: Extranonce = vec![1, 2, 3, 4].try_into().unwrap();

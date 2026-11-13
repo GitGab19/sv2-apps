@@ -126,32 +126,20 @@ impl<State> TranslatorRuntime<State> {
     pub(super) async fn shutdown(self) {
         self.translator.cancellation_token.cancel();
 
-        warn!(
-            "Graceful shutdown: waiting {} seconds for tasks to finish",
-            GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
-        );
-        match tokio::time::timeout(
+        debug!("Waiting up to {GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS} s for tasks to stop");
+        if tokio::time::timeout(
             Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS),
             self.task_manager.join_all(),
         )
         .await
+        .is_err()
         {
-            Ok(_) => {
-                info!("All tasks joined cleanly");
-            }
-            Err(_) => {
-                warn!(
-                    "Tasks did not finish within {} seconds, aborting",
-                    GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
-                );
-                self.task_manager.abort_all().await;
-                info!("Joining aborted tasks...");
-                self.task_manager.join_all().await;
-                warn!("Forced shutdown complete");
-            }
+            warn!("Tasks did not stop within {GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS} s; stopping them");
+            self.task_manager.abort_all().await;
+            self.task_manager.join_all().await;
         }
         self.translator.mark_stopped();
-        info!("TranslatorSv2 shutdown complete.");
+        info!("Translator Proxy stopped");
     }
 
     fn payout_mode(&self, user_identity: &str) -> Result<Option<PayoutMode>, TproxyErrorKind> {
@@ -160,15 +148,12 @@ impl<State> TranslatorRuntime<State> {
             .config
             .expected_payout_distribution(user_identity)
             .map_err(|e| {
-                TproxyErrorKind::InvalidUserIdentity(format!(
-                    "invalid payout user_identity `{user_identity}`: {e}"
-                ))
+                let message = format!("invalid payout user_identity `{user_identity}`: {e}");
+                error!("Cannot check the payout of jobs from the SV2 server: {message}");
+                TproxyErrorKind::InvalidUserIdentity(message)
             })?;
         if let Some(distribution) = &expected_payout_distribution {
-            info!(
-                "Payout verification enabled for configured user_identity: {}",
-                distribution
-            );
+            info!("Checking that jobs from the SV2 server pay {distribution}");
         }
         Ok(expected_payout_distribution)
     }
@@ -182,7 +167,13 @@ impl TranslatorRuntime<Init> {
             .config
             .downstream_address
             .parse::<std::net::IpAddr>()
-            .map_err(|e| TproxyErrorKind::General(format!("Invalid downstream address: {e}")))?;
+            .map_err(|e| {
+                error!(
+                    "downstream_address {} is not an IP address: {e}",
+                    translator.config.downstream_address
+                );
+                TproxyErrorKind::General(format!("Invalid downstream address: {e}"))
+            })?;
 
         let listen_addr = SocketAddr::new(downstream_addr_ip, translator.config.downstream_port);
 
@@ -340,12 +331,11 @@ impl TranslatorRuntime<Sv1ServerReady> {
         request: ReconnectRequest,
     ) -> Result<TranslatorRuntime<UpstreamReady>, BootstrapError> {
         let upstream = request.into_upstream();
-        info!("Reconnecting to {}:{}", upstream.host, upstream.port);
         match self.connect_with_retries(&upstream).await {
             Ok(true) => Ok(self.into_upstream_ready()),
             Ok(false) => {
                 warn!(
-                    "Could not reconnect to {}:{}; trying the configured upstreams",
+                    "Could not reconnect to SV2 server {}:{}; trying the configured SV2 servers",
                     upstream.host, upstream.port
                 );
                 self.try_upstream().await
@@ -386,17 +376,18 @@ impl TranslatorRuntime<Sv1ServerReady> {
         for i in 0..upstream_len {
             if self.upstream_addresses[i].tried_or_flagged {
                 debug!(
-                    "Upstream previously marked as malicious, skipping initial attempt warnings."
+                    "Skipping SV2 server {}:{}: already tried",
+                    self.upstream_addresses[i].host, self.upstream_addresses[i].port
                 );
                 continue;
             }
 
             info!(
-                "Trying upstream {} of {}: {}:{}",
-                i + 1,
-                upstream_len,
+                "Connecting to SV2 server {}:{} ({} of {})",
                 self.upstream_addresses[i].host,
-                self.upstream_addresses[i].port
+                self.upstream_addresses[i].port,
+                i + 1,
+                upstream_len
             );
 
             let upstream = self.upstream_addresses[i].clone();
@@ -407,10 +398,7 @@ impl TranslatorRuntime<Sv1ServerReady> {
             }
         }
 
-        tracing::error!(
-            "All upstreams failed after {} retries each",
-            MAX_UPSTREAM_RETRIES
-        );
+        error!("No configured SV2 server left to try");
         Err(TproxyErrorKind::CouldNotInitiateSystem)
     }
 
@@ -423,7 +411,6 @@ impl TranslatorRuntime<Sv1ServerReady> {
         upstream: &UpstreamEntry,
     ) -> Result<bool, TproxyErrorKind> {
         for attempt in 1..=MAX_UPSTREAM_RETRIES {
-            info!("Connection attempt {}/{}...", attempt, MAX_UPSTREAM_RETRIES);
             tokio::time::sleep(Duration::from_secs(1)).await;
 
             match self.try_initialize_upstream_single(upstream).await {
@@ -439,21 +426,19 @@ impl TranslatorRuntime<Sv1ServerReady> {
                 }
                 Err(e) => {
                     if e.action.is_shutdown() {
-                        error!("Fatal shutdown signal during upstream setup: {:?}", e.kind);
+                        error!(error = ?e.kind, "Fatal shutdown signal during upstream setup");
                         return Err(e.kind);
                     }
 
                     warn!(
-                        "Attempt {}/{} failed for {}:{}: {:?}",
-                        attempt, MAX_UPSTREAM_RETRIES, upstream.host, upstream.port, e
+                        "Cannot connect to SV2 server {}:{}: {} (attempt {attempt} of {MAX_UPSTREAM_RETRIES})",
+                        upstream.host,
+                        upstream.port,
+                        connection_failure_reason(&e.kind)
                     );
                 }
             }
         }
-        warn!(
-            "Max retries reached for {}:{}, moving to next upstream",
-            upstream.host, upstream.port
-        );
         Ok(false)
     }
 
@@ -490,7 +475,6 @@ impl TranslatorRuntime<UpstreamReady> {
     /// Activates the background execution loops of the SV1 server, [`ChannelManager`], and
     /// monitoring server, transitioning the runtime to [`Running`].
     pub(super) async fn start_services(self) -> Result<TranslatorRuntime<Running>, BootstrapError> {
-        info!("Launching SV1 server...");
         if let Err(e) = self
             .state
             .sv1_server
@@ -502,11 +486,10 @@ impl TranslatorRuntime<UpstreamReady> {
             )
             .await
         {
-            error!("SV1 server startup failed: {e:?}");
+            error!(error = ?e, "SV1 server startup failed");
             return Err(BootstrapError::from((e.kind, self)));
         }
 
-        info!("Launching ChannelManager tasks...");
         ChannelManager::run_channel_manager_tasks(
             self.state.channel_manager.clone(),
             self.translator.cancellation_token.clone(),
@@ -517,9 +500,8 @@ impl TranslatorRuntime<UpstreamReady> {
 
         #[cfg(feature = "monitoring")]
         if let Some(monitoring_addr) = self.translator.config.monitoring_address() {
-            info!("Initializing monitoring server on http://{monitoring_addr}");
             if let Err(e) = self.start_monitoring_tasks(monitoring_addr) {
-                error!("Failed to initialize monitoring tasks: {e}");
+                error!(error = %e, "Failed to initialize monitoring tasks");
                 return Err(BootstrapError::from((e, self)));
             }
         }
@@ -561,12 +543,8 @@ impl TranslatorRuntime<UpstreamReady> {
         let fallback_coordinator_token = self.fallback_coordinator.token();
         let shutdown_signal = async move {
             tokio::select! {
-                _ = cancellation_token_clone.cancelled() => {
-                    info!("Monitoring server: received shutdown signal.");
-                }
-                _ = fallback_coordinator_token.cancelled() => {
-                    info!("Monitoring server: fallback triggered.");
-                }
+                _ = cancellation_token_clone.cancelled() => {}
+                _ = fallback_coordinator_token.cancelled() => {}
             }
         };
 
@@ -574,11 +552,11 @@ impl TranslatorRuntime<UpstreamReady> {
             let cancellation_token = self.translator.cancellation_token.clone();
             async move {
                 if let Err(e) = monitoring_server.run(shutdown_signal).await {
-                    error!("Monitoring server error: {:?}", e);
+                    error!(error = ?e, "Monitoring server encountered an error");
                     cancellation_token.cancel();
                 }
 
-                info!("Monitoring server task exited");
+                debug!("Monitoring server stopped");
             }
         }));
 
@@ -591,7 +569,7 @@ impl TranslatorRuntime<UpstreamReady> {
                     .run_miner_telemetry_loop(refresh_interval, cancellation_token, fallback_token)
                     .await;
 
-                info!("SV1 miner telemetry task exited");
+                debug!("SV1 miner telemetry stopped");
             }
         }));
 
@@ -631,9 +609,7 @@ impl TranslatorRuntime<Running> {
     }
 
     pub(super) async fn cleanup_for_fallback(self) -> TranslatorRuntime<Sv1ServerReady> {
-        info!("Preparing fallback");
         self.fallback_coordinator.trigger_fallback_and_wait().await;
-        info!("All components finished fallback cleanup");
         // `wait` already took the request that caused this teardown. One recorded while it was
         // under way, after another component triggered it, is dropped rather than followed later.
         let _ = self
@@ -655,5 +631,26 @@ impl TranslatorRuntime<Running> {
         .bootstrap_io()
         .bootstrap_channel_manager()
         .bootstrap_sv1_server()
+    }
+}
+
+/// Describes why a connection attempt to an SV2 server failed, in words an operator can act on.
+fn connection_failure_reason(kind: &TproxyErrorKind) -> String {
+    use stratum_apps::network_helpers::Error as NetworkError;
+    match kind {
+        TproxyErrorKind::Io(e) => e.to_string(),
+        TproxyErrorKind::Timeout => "timed out".to_string(),
+        TproxyErrorKind::NetworkHelpersError(NetworkError::DnsResolutionFailed(e)) => {
+            format!("cannot resolve the host name ({e})")
+        }
+        TproxyErrorKind::InvalidKey => "authority_pubkey is not a valid key".to_string(),
+        TproxyErrorKind::NetworkHelpersError(e) => {
+            format!("SV2 handshake failed: {e} (check authority_pubkey)")
+        }
+        TproxyErrorKind::SetupConnectionError => "the server refused the connection".to_string(),
+        TproxyErrorKind::ChannelErrorReceiver(_) => {
+            "the connection closed during the SV2 handshake".to_string()
+        }
+        other => other.to_string(),
     }
 }

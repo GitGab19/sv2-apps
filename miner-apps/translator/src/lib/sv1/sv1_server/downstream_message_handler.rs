@@ -4,7 +4,7 @@ use stratum_apps::stratum_core::sv1_api::{
     json_rpc, server_to_client,
     utils::{Extranonce, HexU32Be, VERSION_ROLLING_MASK},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     error::{self, TproxyError},
@@ -27,8 +27,7 @@ impl IsServer for Sv1Server {
     ) -> Result<(Option<server_to_client::VersionRollingParams>, Option<bool>), Self::Error> {
         let downstream_id = client_id.expect("Downstream id should exist");
 
-        info!("Received mining.configure from SV1 downstream");
-        debug!("Downstream {downstream_id}: mining.configure = {}", request);
+        debug!("Received from SV1 client {downstream_id}: {request}");
 
         self.with_registered_downstream(downstream_id, |downstream| {
             downstream
@@ -41,7 +40,7 @@ impl IsServer for Sv1Server {
                     data.version_rolling_min_bit = request.version_rolling_min_bit_count();
 
                     debug!(
-                        "Negotiated version_rolling_mask: {:?}",
+                        "SV1 client {downstream_id} rolls version bits under mask {:?}",
                         data.version_rolling_mask
                     );
 
@@ -63,8 +62,7 @@ impl IsServer for Sv1Server {
     ) -> Result<Vec<(String, String)>, Self::Error> {
         let downstream_id = client_id.expect("Downstream id should exist");
 
-        info!("Received mining.subscribe from Sv1 downstream");
-        debug!("Down: Handling mining.subscribe: {}", request);
+        debug!("Received from SV1 client {downstream_id}: {request}");
 
         let set_difficulty_sub = (
             "mining.set_difficulty".to_string(),
@@ -85,8 +83,7 @@ impl IsServer for Sv1Server {
         request: &client_to_server::Authorize,
     ) -> Result<bool, Self::Error> {
         let downstream_id = client_id.expect("Downstream id should exist");
-        info!("Received mining.authorize from Sv1 downstream {downstream_id}");
-        debug!("Down: Handling mining.authorize: {}", request);
+        debug!("Received from SV1 client {downstream_id}: {request}");
         Ok(true)
     }
 
@@ -96,6 +93,7 @@ impl IsServer for Sv1Server {
         request: &client_to_server::Submit,
     ) -> Result<SubmitOutcome, Self::Error> {
         let downstream_id = client_id.expect("Downstream id should exist");
+        debug!("Received from SV1 client {downstream_id}: {request}");
 
         let job_id = &request.job_id;
 
@@ -126,6 +124,20 @@ impl IsServer for Sv1Server {
             .flatten();
 
         let Some(job) = job else {
+            if let Some(name) = self
+                .downstreams
+                .with(&downstream_id, |downstream| {
+                    downstream
+                        .downstream_data
+                        .with(|data| data.client_name())
+                        .ok()
+                })
+                .flatten()
+            {
+                info!(
+                    "Rejected a stale share from SV1 client {name}: job {job_id} is no longer valid"
+                );
+            }
             return Ok(SubmitOutcome::Rejected(SubmitError::JobNotFound));
         };
 
@@ -136,23 +148,18 @@ impl IsServer for Sv1Server {
                     let channel_id = match data.channel_id {
                         Some(id) => id,
                         None => {
-                            error!(
-                                "Cannot submit share: channel_id is None \
-                         (waiting for OpenExtendedMiningChannelSuccess)"
+                            warn!(
+                                downstream_id,
+                                "Cannot submit share: channel is not open yet (waiting for OpenExtendedMiningChannelSuccess)"
                             );
                             return Ok(SubmitOutcome::Rejected(SubmitError::Other));
                         }
                     };
 
-                    info!(
-                        "Received mining.submit from SV1 downstream for channel id: {}",
-                        channel_id
-                    );
-
                     let Some(job_context) = data.job_validation_context(job_id) else {
-                        debug!(
-                            job_id,
-                            channel_id, "Submitted SV1 job is no longer valid for this downstream"
+                        info!(
+                            "Rejected a stale share from SV1 client {}: job {job_id} is no longer valid",
+                            data.client_name()
                         );
                         return Ok(SubmitOutcome::Rejected(SubmitError::JobNotFound));
                     };
@@ -165,6 +172,10 @@ impl IsServer for Sv1Server {
                     ) {
                         Ok(Sv1ShareValidationOutcome::MeetsTarget(hash)) => hash,
                         Ok(Sv1ShareValidationOutcome::DoesNotMeetTarget) => {
+                            warn!(
+                                "Rejected a share from SV1 client {}: below its difficulty",
+                                data.client_name()
+                            );
                             return Ok(SubmitOutcome::Rejected(SubmitError::LowDifficultyShare));
                         }
                         Err(error) => {
@@ -174,6 +185,10 @@ impl IsServer for Sv1Server {
                     };
 
                     if !data.accepted_share_hashes.insert_if_new(share_hash) {
+                        warn!(
+                            "Rejected a duplicate share from SV1 client {}",
+                            data.client_name()
+                        );
                         return Ok(SubmitOutcome::Rejected(SubmitError::DuplicateShare));
                     }
 
@@ -196,6 +211,7 @@ impl IsServer for Sv1Server {
     /// Indicates to the server that the client supports the mining.set_extranonce method.
     fn handle_extranonce_subscribe(&mut self, client_id: Option<usize>) -> Result<(), Self::Error> {
         let downstream_id = client_id.expect("Downstream id should exist");
+        debug!("Received from SV1 client {downstream_id}: mining.extranonce.subscribe");
         self.with_registered_downstream(downstream_id, |downstream| {
             downstream
                 .downstream_data
@@ -228,10 +244,6 @@ impl IsServer for Sv1Server {
                         data.sv1_username = name.to_string();
                     }
                     data.sv1_worker_name = sv1_worker_name_from_sv1_username(name).to_string();
-                    debug!(
-                        "Down: Set sv1_username '{}' and sv1_worker_name '{}' for downstream {}",
-                        data.sv1_username, data.sv1_worker_name, downstream_id
-                    );
                 })
                 .map_err(TproxyError::shutdown)
         })?;
@@ -340,7 +352,7 @@ impl IsServer for Sv1Server {
     }
 
     fn notify(&mut self, _client_id: Option<usize>) -> Result<json_rpc::Message, Self::Error> {
-        warn!("notify() called on Sv1Server - this method is not implemented for Sv1Server");
+        warn!("notify() called on Sv1Server: method is not implemented");
         Err(
             stratum_apps::stratum_core::sv1_api::error::Error::UnexpectedMessage(
                 "notify".to_string(),

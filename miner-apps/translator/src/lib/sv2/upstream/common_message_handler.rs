@@ -11,7 +11,7 @@ use stratum_apps::stratum_core::{
     handlers_sv2::HandleCommonMessagesFromServerOwnedAsync,
     parsers_sv2::Tlv,
 };
-use tracing::{error, info};
+use tracing::{debug, info, warn};
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl HandleCommonMessagesFromServerOwnedAsync for Upstream {
@@ -30,7 +30,12 @@ impl HandleCommonMessagesFromServerOwnedAsync for Upstream {
         msg: SetupConnectionErrorOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        error!("Received: {}", msg);
+        debug!("Received from SV2 server: {}", msg);
+        let error_code = msg.error_code.as_utf8_or_hex();
+        warn!(
+            "SV2 server {} refused the connection: {error_code}",
+            self.address
+        );
         Err(TproxyError::fallback(TproxyErrorKind::SetupConnectionError))
     }
 
@@ -40,7 +45,11 @@ impl HandleCommonMessagesFromServerOwnedAsync for Upstream {
         msg: SetupConnectionSuccessOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        info!("Received: {}", msg);
+        debug!("Received from SV2 server: {}", msg);
+        info!(
+            "SV2 handshake completed with SV2 server {} (authority key {})",
+            self.address, self.entry.authority_pubkey
+        );
         Ok(())
     }
 
@@ -50,7 +59,7 @@ impl HandleCommonMessagesFromServerOwnedAsync for Upstream {
         msg: ChannelEndpointChangedOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        info!("Received: {}", msg);
+        debug!("Received from SV2 server: {}", msg);
         // Extension state must be reset and negotiated again. Reconnecting to the same upstream
         // does both, and keeps negotiation a one-time step per connection.
         Err(TproxyError::reconnect(ReconnectRequest::EndpointChanged {
@@ -65,7 +74,7 @@ impl HandleCommonMessagesFromServerOwnedAsync for Upstream {
         msg: ReconnectOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        info!("Received: {}", msg);
+        debug!("Received from SV2 server: {}", msg);
         // A host tProxy cannot use is handled like an unreachable one: tProxy moves on to the
         // configured upstreams.
         let new_host = std::str::from_utf8(msg.new_host.as_bytes())

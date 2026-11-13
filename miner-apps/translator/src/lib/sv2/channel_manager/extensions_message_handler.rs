@@ -1,6 +1,7 @@
 use crate::{
     error::{self, TproxyError, TproxyErrorKind},
     sv2::channel_manager::ChannelManager,
+    utils::describe_extensions,
 };
 use stratum_apps::{
     stratum_core::{
@@ -13,7 +14,7 @@ use stratum_apps::{
     },
     utils::types::OutboundFrame,
 };
-use tracing::{error, info};
+use tracing::{debug, info, warn};
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl HandleExtensionsFromServerOwnedAsync for ChannelManager {
@@ -34,9 +35,9 @@ impl HandleExtensionsFromServerOwnedAsync for ChannelManager {
         msg: RequestExtensionsSuccessOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        let supported: Vec<u16> = msg.supported_extensions.into_inner();
+        debug!("Received from SV2 server: {}", msg);
 
-        info!("Extension negotiation success: supported={:?}", supported);
+        let supported: Vec<u16> = msg.supported_extensions.into_inner();
 
         // Check if all of the proxy's required extensions are supported by the server
         let missing_required: Vec<u16> = self
@@ -47,21 +48,28 @@ impl HandleExtensionsFromServerOwnedAsync for ChannelManager {
             .collect();
 
         if !missing_required.is_empty() {
-            error!(
-                "Server does not support our required extensions {:?}. Connection should fail over to another upstream.",
-                missing_required
+            warn!(
+                "SV2 server does not support required extensions {}",
+                describe_extensions(&missing_required)
             );
             return Err(TproxyError::fallback(TproxyErrorKind::General(format!(
                 "Server does not support required extensions: {missing_required:?}"
             ))));
         }
 
+        if supported.is_empty() {
+            debug!("SV2 server accepted none of the requested extensions");
+        } else {
+            info!(
+                "SV2 server accepted extensions: {}",
+                describe_extensions(&supported)
+            );
+        }
+
         // Store the negotiated extensions in the shared channel manager data
         self.negotiated_extensions
             .set(supported)
             .map_err(TproxyError::shutdown)?;
-
-        info!("Successfully negotiated extensions");
 
         Ok(())
     }
@@ -72,13 +80,10 @@ impl HandleExtensionsFromServerOwnedAsync for ChannelManager {
         msg: RequestExtensionsErrorOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
+        debug!("Received from SV2 server: {}", msg);
+
         let unsupported: Vec<u16> = msg.unsupported_extensions.into_inner();
         let required_by_server: Vec<u16> = msg.required_extensions.into_inner();
-
-        error!(
-            "Extension negotiation error: unsupported={:?}, required_by_server={:?}",
-            unsupported, required_by_server
-        );
 
         // Check if any of our required extensions were not supported by the server
         let missing_required: Vec<u16> = self
@@ -89,9 +94,9 @@ impl HandleExtensionsFromServerOwnedAsync for ChannelManager {
             .collect();
 
         if !missing_required.is_empty() {
-            error!(
-                "Server does not support our required extensions {:?}. Connection should fail over to another upstream.",
-                missing_required
+            warn!(
+                "SV2 server does not support required extensions {}",
+                describe_extensions(&missing_required)
             );
             return Err(TproxyError::fallback(
                 TproxyErrorKind::RequiredExtensionsNotSupported(missing_required),
@@ -115,9 +120,9 @@ impl HandleExtensionsFromServerOwnedAsync for ChannelManager {
 
             if !cannot_support.is_empty() {
                 // Server requires extensions we don't support - must fail over
-                error!(
-                    "Server requires extensions {:?} that we don't support. Connection should fail over to another upstream.",
-                    cannot_support
+                warn!(
+                    "SV2 server requires extensions tProxy does not support ({})",
+                    describe_extensions(&cannot_support)
                 );
                 return Err(TproxyError::fallback(
                     TproxyErrorKind::ServerRequiresUnsupportedExtensions(cannot_support),
@@ -125,15 +130,13 @@ impl HandleExtensionsFromServerOwnedAsync for ChannelManager {
             }
 
             // All required extensions are supported - we should retry with them included
-            info!(
-                "Server requires extensions {:?} that we support. Proxy should retry RequestExtensions with these included.",
-                can_support
-            );
+            debug!("Retrying RequestExtensions with the extensions the SV2 server requires");
 
             let new_require_extensions = RequestExtensionsOwned {
                 request_id: msg.request_id + 1,
                 requested_extensions: Seq064KOwned::new(can_support).unwrap(),
             };
+            debug!("Sending to SV2 server: {new_require_extensions}");
 
             let sv2_frame = OutboundFrame::from_message(AnyMessageOwned::Extensions(
                 new_require_extensions.into(),
@@ -145,7 +148,7 @@ impl HandleExtensionsFromServerOwnedAsync for ChannelManager {
                 .send(sv2_frame)
                 .await
                 .map_err(|e| {
-                    error!("Failed to send message to upstream: {:?}", e);
+                    debug!(error = ?e, "Failed to forward message (channel closed)");
                     TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
                 })?;
         }

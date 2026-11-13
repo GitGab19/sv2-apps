@@ -15,9 +15,12 @@ use stratum_apps::{
             merkle_root::merkle_root_from_path,
             target::{bytes_to_hex, u256_to_block_hash},
         },
-        extensions_sv2::{MAX_USER_IDENTITY_LENGTH, UserIdentity},
+        extensions_sv2::{
+            EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, MAX_USER_IDENTITY_LENGTH, UserIdentity,
+        },
         sv1_api::{
             client_to_server::{self, Submit},
+            json_rpc,
             server_to_client::Notify,
             utils::{HexU32Be, VERSION_ROLLING_MASK},
         },
@@ -118,7 +121,7 @@ pub fn validate_sv1_share(
     let target_bytes = target.to_be_bytes();
 
     debug!(
-        "share validation \nshare:\t\t{}\ndownstream target:\t{}\n",
+        "Share validation: hash {} against the SV1 client's target {}",
         bytes_to_hex(&hash_bytes),
         bytes_to_hex(&target_bytes),
     );
@@ -305,6 +308,56 @@ pub struct SubmitShareWithChannelId {
 /// Format: `{original_job_id}#{counter}`
 pub(crate) const KEEPALIVE_JOB_ID_DELIMITER: char = '#';
 
+/// Names SV2 extensions for log lines meant for operators.
+pub(crate) fn describe_extensions(extensions: &[u16]) -> String {
+    extensions
+        .iter()
+        .map(|&extension| match extension {
+            EXTENSION_TYPE_WORKER_HASHRATE_TRACKING => {
+                format!("worker-name tracking (0x{extension:04x})")
+            }
+            _ => format!("0x{extension:04x}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Formats a hashrate in H/s with an SI prefix, for log lines meant for operators.
+pub(crate) fn format_hashrate(hashrate: f32) -> String {
+    const UNITS: [&str; 7] = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s"];
+    let mut value = f64::from(hashrate);
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if value >= 100.0 || value.fract() == 0.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Names a channel in the TRACE lines for messages tProxy's components pass to each other.
+///
+/// [`AGGREGATED_CHANNEL_ID`] is not a channel of its own: it stands for every SV1 client on the
+/// aggregated SV2 channel. Any other id is said as plain "channel", because in aggregated mode it
+/// is one of tProxy's per-client channels, not a channel the SV2 server knows.
+pub(crate) fn channel_label(channel_id: ChannelId) -> String {
+    if channel_id == AGGREGATED_CHANNEL_ID {
+        "the aggregated SV2 channel".to_string()
+    } else {
+        format!("channel {channel_id}")
+    }
+}
+
+/// Renders an SV1 message as the single line of JSON that goes on the wire, for DEBUG lines.
+///
+/// Only for messages tProxy sends: a client's `mining.authorize` carries its password.
+pub(crate) fn sv1_message_json(message: &json_rpc::Message) -> String {
+    serde_json::to_string(message).unwrap_or_else(|_| message.to_string())
+}
+
 /// Derives the SV1 worker name from the full `mining.authorize` username.
 pub(crate) fn sv1_worker_name_from_sv1_username(sv1_username: &str) -> &str {
     sv1_username
@@ -343,9 +396,11 @@ pub(crate) fn tlv_user_identity_from_sv1_worker_name(
         }
         let tlv_user_identity = &sv1_worker_name[..end];
         warn!(
-            "extension 0x0002 negotiated; sv1_worker_name '{}' exceeds {} bytes ({} bytes), \
-             truncating TLV user_identity to '{}'",
-            sv1_worker_name, MAX_USER_IDENTITY_LENGTH, len, tlv_user_identity
+            worker_name = %sv1_worker_name,
+            len,
+            max_len = MAX_USER_IDENTITY_LENGTH,
+            truncated = %tlv_user_identity,
+            "SV1 worker name exceeds maximum length: truncating for extension 0x0002",
         );
         tlv_user_identity
     };

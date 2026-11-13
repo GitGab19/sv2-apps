@@ -16,7 +16,7 @@ use stratum_apps::{
     utils::types::DownstreamId,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 use crate::sv1::{Downstream, Sv1Server};
 
@@ -130,7 +130,7 @@ impl Sv1Server {
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
         if discovery_cidrs.is_empty() {
-            info!("SV1 miner telemetry discovery disabled: no miner_telemetry cidrs configured");
+            debug!("SV1 miner telemetry discovery disabled (no CIDRs configured)");
             return;
         }
 
@@ -141,31 +141,19 @@ impl Sv1Server {
         let mut last_discovery = None::<Instant>;
 
         info!(
-            "Starting SV1 miner telemetry loop with interval of {} seconds and discovery interval of {} seconds",
-            refresh_interval.as_secs(),
-            MINER_TELEMETRY_DISCOVERY_INTERVAL.as_secs()
+            "Reading SV1 miner telemetry from {} every {} s",
+            discovery_cidrs.join(", "),
+            refresh_interval.as_secs()
         );
 
         loop {
             tokio::select! {
-                _ = cancellation_token.cancelled() => {
-                    info!("SV1 miner telemetry loop received shutdown signal");
-                    break;
-                }
-                _ = fallback_token.cancelled() => {
-                    info!("SV1 miner telemetry loop received fallback signal");
-                    break;
-                }
+                _ = cancellation_token.cancelled() => break,
+                _ = fallback_token.cancelled() => break,
                 _ = interval.tick() => {
                     tokio::select! {
-                        _ = cancellation_token.cancelled() => {
-                            info!("SV1 miner telemetry loop received shutdown signal");
-                            break;
-                        }
-                        _ = fallback_token.cancelled() => {
-                            info!("SV1 miner telemetry loop received fallback signal");
-                            break;
-                        }
+                        _ = cancellation_token.cancelled() => break,
+                        _ = fallback_token.cancelled() => break,
                         _ = async {
                             let should_discover = last_discovery
                                 .map(|last| last.elapsed() >= MINER_TELEMETRY_DISCOVERY_INTERVAL)
@@ -198,7 +186,7 @@ impl Sv1Server {
             .iter()
             .map(|(downstream_id, _)| *downstream_id)
             .collect::<HashSet<_>>();
-        debug!(
+        trace!(
             ?downstreams,
             ?discovered_miners,
             pool_port = self.config.downstream_port,
@@ -216,7 +204,7 @@ impl Sv1Server {
             && !discovered_miners.is_empty()
         {
             debug!(
-                "SV1 miner telemetry discovered {} miner management interfaces but could not match them to {} active downstreams",
+                "SV1 miner telemetry matched none of the {} miners it found to the {} SV1 clients",
                 discovered_miners.len(),
                 downstreams.len()
             );

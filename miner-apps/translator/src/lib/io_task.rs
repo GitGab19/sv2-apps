@@ -4,12 +4,16 @@ use async_channel::{Receiver, Sender};
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
     fallback_coordinator::FallbackCoordinator,
-    network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf},
+    network_helpers::{
+        Error as NetworkError,
+        noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf},
+    },
+    stratum_core::framing_sv2::header::Header,
     task_manager::TaskManager,
     utils::types::{InboundFrame, OutboundFrame},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument as _, error, trace, warn};
+use tracing::{debug, error, trace};
 
 #[cfg_attr(not(test), hotpath::measure)]
 #[track_caller]
@@ -23,7 +27,6 @@ pub fn spawn_io_tasks(
     cancellation_token: CancellationToken,
     fallback_coordinator: FallbackCoordinator,
 ) {
-    let caller = std::panic::Location::caller();
     let inbound_tx_clone = inbound_tx.clone();
     let outbound_rx_clone = outbound_rx.clone();
 
@@ -48,15 +51,23 @@ pub fn spawn_io_tasks(
                     res = reader.read_frame() => {
                         match res {
                             Ok(sv2_frame) => {
-                                trace!("Received inbound frame");
+                                trace!(
+                                    "Read frame from SV2 server: {}",
+                                    frame_summary(sv2_frame.header())
+                                );
                                 if let Err(e) = inbound_tx.send(sv2_frame).await {
                                     inbound_tx.close();
-                                    error!(error=?e, "Failed to forward inbound frame");
+                                    trace!(error = ?e, "Inbound channel closed, stopping reader");
                                     break;
                                 }
                             }
+                            Err(NetworkError::SocketClosed) => {
+                                debug!("SV2 server closed the connection");
+                                inbound_tx.close();
+                                break;
+                            }
                             Err(e) => {
-                                error!(error=?e, "Reader error");
+                                error!(error = %e, "Failed to read or decode frame from peer; terminating connection");
                                 inbound_tx.close();
                                 break;
                             }
@@ -69,12 +80,8 @@ pub fn spawn_io_tasks(
             drop(inbound_tx);
             drop(outbound_rx_clone);
 
-            warn!("Reader task exited.");
-        }
-        .instrument(tracing::trace_span!(
-            "reader_task",
-            spawned_at = %format!("{}:{}", caller.file(), caller.line())
-        ));
+            trace!("Reader task exited");
+        };
         task_manager.spawn(fallback_coordinator.track(reader_task));
     }
 
@@ -98,16 +105,27 @@ pub fn spawn_io_tasks(
                     res = outbound_rx.recv() => {
                         match res {
                             Ok(frame) => {
-                                trace!("Sending outbound frame");
-                                if let Err(e) = writer.write_frame(frame).await {
-                                    error!(error=?e, "Writer error");
-                                    outbound_rx.close_and_drain();
-                                    break;
+                                trace!(
+                                    "Writing frame to SV2 server: {}",
+                                    frame_summary(outbound_header(&frame))
+                                );
+                                match writer.write_frame(frame).await {
+                                    Ok(()) => {}
+                                    Err(NetworkError::SocketClosed) => {
+                                        debug!("SV2 server closed the connection while tProxy was writing to it");
+                                        outbound_rx.close_and_drain();
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "Failed to encode or send frame to peer; terminating connection");
+                                        outbound_rx.close_and_drain();
+                                        break;
+                                    }
                                 }
                             }
                             Err(_) => {
                                 outbound_rx.close_and_drain();
-                                warn!("Outbound channel closed");
+                                trace!("Outbound channel closed");
                                 break;
                             }
                         }
@@ -119,12 +137,34 @@ pub fn spawn_io_tasks(
             drop(outbound_rx);
             drop(inbound_tx_clone);
 
-            warn!("Writer task exited.");
-        }
-        .instrument(tracing::trace_span!(
-            "writer_task",
-            spawned_at = %format!("{}:{}", caller.file(), caller.line())
-        ));
+            trace!("Writer task exited");
+        };
         task_manager.spawn(fallback_coordinator.track(writer_task));
+    }
+}
+
+// Describes a frame by its header, for the TRACE lines that mark each frame read from or written
+// to the SV2 server. The channel-message bit travels in the extension type field but is not part
+// of the extension, so it is named on its own.
+fn frame_summary(header: Header) -> String {
+    format!(
+        "extension 0x{:04x}, message type 0x{:02x}{}, payload {} bytes",
+        header.ext_type_without_channel_msg(),
+        header.msg_type(),
+        if header.channel_msg() {
+            ", channel message"
+        } else {
+            ""
+        },
+        header.payload_length()
+    )
+}
+
+// The header of a frame on its way out, whether the encoder serializes it or it is already
+// serialized.
+fn outbound_header(frame: &OutboundFrame) -> Header {
+    match frame {
+        OutboundFrame::Message(frame) => frame.header(),
+        OutboundFrame::Raw(frame) => frame.header(),
     }
 }

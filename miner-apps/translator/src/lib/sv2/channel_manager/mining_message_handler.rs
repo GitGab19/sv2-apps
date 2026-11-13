@@ -9,7 +9,7 @@ use crate::{
 use std::time::Instant;
 use stratum_apps::{
     stratum_core::{
-        bitcoin::Target,
+        bitcoin::{BlockHash, Target, hashes::Hash},
         channels_sv2::{
             client::{extended::ExtendedChannel, group::GroupChannel},
             extranonce_manager::{
@@ -30,7 +30,7 @@ use stratum_apps::{
     },
     utils::types::{ChannelId, DownstreamId},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
@@ -59,7 +59,10 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: OpenStandardMiningChannelSuccessOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        warn!("Received: {}", m);
+        debug!("Received from SV2 server: {}", m);
+        warn!(
+            "OpenStandardMiningChannel.Success unexpected: Translator Proxy only opens extended channels upstream"
+        );
         Err(TproxyError::log(TproxyErrorKind::UnexpectedMessage(
             0,
             MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
@@ -72,6 +75,8 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: OpenExtendedMiningChannelSuccessOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
+        debug!("Received from SV2 server: {}", m);
+
         // Retrieve the pending channel request data.
         // Both aggregated and non-aggregated modes store data in pending_downstream_channels, keyed
         // by request_id, so the lookup is identical for both.
@@ -84,7 +89,10 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
             .pending_downstream_channels
             .remove(&(m.request_id as DownstreamId))
             .ok_or_else(|| {
-                error!("No pending channel found for request_id: {}", m.request_id);
+                error!(
+                    request_id = m.request_id,
+                    "No pending channel found for request ID"
+                );
                 TproxyError::log(TproxyErrorKind::PendingChannelNotFound(m.request_id))
             })?
             .1;
@@ -118,13 +126,16 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
             self.upstream_max_target_key(m.channel_id),
             UpstreamMaxTarget::new(max_target),
         );
+        // In non-aggregated mode the SV1 server announces each channel with its SV1 client.
+        if self.mode.is_aggregated() {
+            info!(
+                "SV2 channel {} opened, mining as {}",
+                m.channel_id,
+                aggregated_upstream_user_identity(&user_identity)
+            );
+        }
 
         let success = {
-            info!(
-                "Received: {:?}, user_identity: {}, nominal_hashrate: {}",
-                m, user_identity, nominal_hashrate
-            );
-
             let full_extranonce_size = m.extranonce_size as usize + m.extranonce_prefix.len();
 
             self.group_channels.with_mut_or_insert_with(
@@ -134,7 +145,12 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     group_channel
                         .add_channel_id(m.channel_id, full_extranonce_size)
                         .map_err(|e| {
-                            error!("Failed to add channel id to group channel: {:?}", e);
+                            error!(
+                                error = ?e,
+                                channel_id = m.channel_id,
+                                group_channel_id = m.group_channel_id,
+                                "Failed to add channel ID to group channel"
+                            );
                             TproxyError::fallback(
                                 TproxyErrorKind::FailedToAddChannelIdToGroupChannel(e),
                             )
@@ -162,9 +178,10 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     < AGGREGATED_TPROXY_LOCAL_PREFIX_BYTES as usize + downstream_extranonce_len
                 {
                     error!(
-                        "Upstream-granted rollable size ({} bytes) is smaller than minimum required ({} bytes) in aggregated mode",
-                        m.extranonce_size,
-                        AGGREGATED_TPROXY_LOCAL_PREFIX_BYTES as usize + downstream_extranonce_len,
+                        granted_extranonce_size = m.extranonce_size,
+                        required_min_size = AGGREGATED_TPROXY_LOCAL_PREFIX_BYTES as usize
+                            + downstream_extranonce_len,
+                        "Upstream-granted rollable extranonce size is smaller than required minimum in aggregated mode"
                     );
                     return Err(TproxyError::fallback(
                         TproxyErrorKind::OpenMiningChannelError,
@@ -182,16 +199,13 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     AGGREGATED_TPROXY_MAX_CHANNELS,
                 )
                 .map_err(|e| {
-                    error!(
-                        "Failed to create ExtranonceAllocator from upstream: {:?}",
-                        e
-                    );
+                    error!(error = ?e, "Failed to create ExtranonceAllocator from upstream prefix");
                     TproxyError::fallback(TproxyErrorKind::OpenMiningChannelError)
                 })?;
                 let new_extranonce_prefix = allocator
                     .allocate_extended(downstream_extranonce_len)
                     .map_err(|e| {
-                        error!("Failed to allocate extended extranonce prefix: {:?}", e);
+                        error!(error = ?e, "Failed to allocate extended extranonce prefix");
                         TproxyError::fallback(TproxyErrorKind::OpenMiningChannelError)
                     })?;
                 let downstream_extranonce_prefix_bytes: Vec<u8> =
@@ -222,10 +236,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                 .map_err(|e| {
                     // an upstream that hands out a target no share can meet is misbehaving, so
                     // fall back
-                    error!(
-                        "Upstream OpenExtendedMiningChannelSuccess rejected: {:?}",
-                        e
-                    );
+                    error!(error = ?e, "Upstream OpenExtendedMiningChannel.Success rejected by channel manager");
                     TproxyError::fallback(TproxyErrorKind::OpenMiningChannelError)
                 })?;
                 self.extended_channels
@@ -248,10 +259,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     self.max_past_jobs,
                 )
                 .map_err(|e| {
-                    error!(
-                        "Upstream OpenExtendedMiningChannelSuccess rejected: {:?}",
-                        e
-                    );
+                    error!(error = ?e, "Downstream OpenExtendedMiningChannel.Success rejected by channel manager");
                     TproxyError::fallback(TproxyErrorKind::OpenMiningChannelError)
                 })?;
                 self.extended_channels
@@ -297,8 +305,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                 // still rolls exactly `downstream_extranonce_len` bytes.
                 if (m.extranonce_size as usize) < downstream_extranonce_len {
                     error!(
-                        "Upstream-granted rollable size ({} bytes) is smaller than requested ({} bytes) in non-aggregated mode",
-                        m.extranonce_size, downstream_extranonce_len,
+                        granted_extranonce_size = m.extranonce_size,
+                        requested_size = downstream_extranonce_len,
+                        "Upstream-granted rollable size is smaller than requested in non-aggregated mode"
                     );
                     return Err(TproxyError::fallback(
                         TproxyErrorKind::OpenMiningChannelError,
@@ -315,7 +324,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     // rewriting.
                     let prefix = ExtranoncePrefix::from_wire(upstream_prefix_bytes.clone())
                         .map_err(|e| {
-                            error!("Upstream extranonce prefix rejected by from_wire: {:?}", e);
+                            error!(error = ?e, "Upstream extranonce prefix rejected by from_wire");
                             TproxyError::shutdown(TproxyErrorKind::OpenMiningChannelError)
                         })?;
                     (prefix, upstream_prefix_bytes)
@@ -325,8 +334,8 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     if (m.extranonce_size as usize) < local_index_bytes + downstream_extranonce_len
                     {
                         error!(
-                            "Upstream-granted rollable size ({} bytes) leaves no room for allocator local_index in non-aggregated mode",
-                            m.extranonce_size,
+                            granted_extranonce_size = m.extranonce_size,
+                            "Upstream-granted rollable size leaves no room for allocator local index in non-aggregated mode"
                         );
                         return Err(TproxyError::fallback(
                             TproxyErrorKind::OpenMiningChannelError,
@@ -353,16 +362,13 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                         NON_AGGREGATED_TPROXY_MAX_CHANNELS,
                     )
                     .map_err(|e| {
-                        error!(
-                            "Failed to create ExtranonceAllocator from upstream: {:?}",
-                            e
-                        );
+                        error!(error = ?e, "Failed to create ExtranonceAllocator from upstream prefix");
                         TproxyError::fallback(TproxyErrorKind::OpenMiningChannelError)
                     })?;
                     let prefix = allocator
                         .allocate_extended(downstream_extranonce_len)
                         .map_err(|e| {
-                            error!("Failed to allocate extended extranonce prefix: {:?}", e);
+                            error!(error = ?e, "Failed to allocate extended extranonce prefix");
                             TproxyError::fallback(TproxyErrorKind::OpenMiningChannelError)
                         })?;
                     let wire_bytes = prefix.as_bytes().to_vec();
@@ -388,10 +394,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                 .map_err(|e| {
                     // an upstream that hands out a target no share can meet is misbehaving, so
                     // fall back
-                    error!(
-                        "Upstream OpenExtendedMiningChannelSuccess rejected: {:?}",
-                        e
-                    );
+                    error!(error = ?e, "Upstream OpenExtendedMiningChannel.Success rejected by channel manager");
                     TproxyError::fallback(TproxyErrorKind::OpenMiningChannelError)
                 })?;
                 self.extended_channels
@@ -421,7 +424,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
             ))
             .await
             .map_err(|e| {
-                error!("Failed to send OpenExtendedMiningChannelSuccess: {:?}", e);
+                debug!(error = ?e, "Failed to forward message (channel closed)");
                 TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
             })?;
         self.sv1_advertised_extranonce_prefixes.insert(
@@ -452,7 +455,11 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: OpenMiningChannelErrorOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        warn!("Received: {}", m);
+        debug!("Received from SV2 server: {}", m);
+        warn!(
+            "SV2 server refused to open an SV2 channel: {}; disconnecting all SV1 clients",
+            m.error_code.as_utf8_or_hex()
+        );
         Err(TproxyError::fallback(
             TproxyErrorKind::OpenMiningChannelError,
         ))
@@ -464,7 +471,12 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: UpdateChannelErrorOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        warn!("Received: {}", m);
+        debug!("Received from SV2 server: {}", m);
+        let error_code = m.error_code.as_utf8_or_hex();
+        warn!(
+            "SV2 server rejected an UpdateChannel on SV2 channel {}: {error_code}",
+            m.channel_id
+        );
         // The upstream rejected a `max_target` change, so a value it accepted stays in force.
         let key = self.upstream_max_target_key(m.channel_id);
         self.upstream_max_targets.with_mut(&key, |bound| {
@@ -479,12 +491,17 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: CloseChannelOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        info!("Received: {}", m);
+        debug!("Received from SV2 server: {}", m);
         // are we working in aggregated mode?
         if self.mode.is_aggregated() {
             // even if aggregated channel_id != m.channel_id, we should trigger fallback
             // because why would a sane server send a CloseChannel message to a different
             // channel?
+            warn!(
+                "SV2 server closed SV2 channel {}: {}; disconnecting all SV1 clients",
+                m.channel_id,
+                m.reason_code.as_utf8_or_hex()
+            );
             return Err(TproxyError::fallback(
                 TproxyErrorKind::AggregatedChannelClosed,
             ));
@@ -506,9 +523,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
             closed_channel_ids = vec![m.channel_id];
             self.remove_channel_from_groups(m.channel_id);
         } else {
-            error!(
-                "Channel Id not found: {}, ignoring CloseChannel message",
-                m.channel_id
+            warn!(
+                channel_id = m.channel_id,
+                "Ignoring CloseChannel for unknown channel ID"
             );
             return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
         }
@@ -529,10 +546,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                 .send(MiningOwned::CloseChannel(close))
                 .await
                 .map_err(|error| {
-                    error!(
-                        channel_id,
-                        "Failed to forward upstream CloseChannel to SV1 server: {error:?}"
-                    );
+                    debug!(error = ?error, channel_id, "Failed to forward message (channel closed)");
                     TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
                 })?;
         }
@@ -546,7 +560,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: SetExtranoncePrefixOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        warn!("Received: {}", m);
+        debug!("Received from SV2 server: {}", m);
 
         let new_upstream_prefix = m.extranonce_prefix.to_owned_bytes();
 
@@ -690,7 +704,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: SubmitSharesSuccessOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        info!("Received: {} ✅", m);
+        debug!("Received from SV2 server: {}", m);
 
         // In aggregated mode, the Pool responds with the upstream channel ID, but the
         // channel is stored under AGGREGATED_CHANNEL_ID in the shared channel map.
@@ -715,8 +729,19 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: SubmitSharesErrorOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        warn!("Received: {} ❌", m);
+        debug!("Received from SV2 server: {}", m);
         let error_code = m.error_code.as_utf8_or_hex();
+        if error_code == "stale-share" {
+            info!(
+                "SV2 server rejected a stale share on SV2 channel {}",
+                m.channel_id
+            );
+        } else {
+            warn!(
+                "SV2 server rejected a share on SV2 channel {}: {error_code}",
+                m.channel_id
+            );
+        }
 
         let key = if self.mode.is_aggregated() {
             AGGREGATED_CHANNEL_ID
@@ -738,10 +763,8 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: NewMiningJobOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        warn!("Received: {}", m);
-        warn!(
-            "⚠️ Cannot process NewMiningJob since Translator Proxy supports only extended mining jobs. Ignoring."
-        );
+        debug!("Received from SV2 server: {}", m);
+        warn!("NewMiningJob ignored: Translator Proxy only supports extended mining jobs");
         Ok(())
     }
 
@@ -751,7 +774,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: NewExtendedMiningJobOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        info!("Received: {}", m);
+        debug!("Received from SV2 server: {}", m);
 
         // tProxy declares version rolling as required in SetupConnection. Most SV1 miners need it
         // to produce usable shares, so forwarding a job that disables it would make tProxy discard
@@ -759,11 +782,28 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         // response as a connection failure before exposing the job to any downstream.
         if !m.version_rolling_allowed {
             error!(
-                "Upstream sent a NewExtendedMiningJob with version rolling disabled after accepting it as a required feature"
+                channel_id = m.channel_id,
+                "Upstream sent NewExtendedMiningJob with version rolling disabled after accepting it as a required feature"
             );
             return Err(TproxyError::fallback(
                 TproxyErrorKind::VersionRollingNotAllowed,
             ));
+        }
+
+        let (channels, _, prev_hash) = self.describe_job_target(m.channel_id);
+        match (m.is_future(), prev_hash) {
+            (true, _) => info!(
+                "Future job {} received from the SV2 server for {channels}, waiting for its prevhash",
+                m.job_id
+            ),
+            (false, Some(prev_hash)) => info!(
+                "Job {} received from the SV2 server for {channels} (prevhash {prev_hash})",
+                m.job_id
+            ),
+            (false, None) => info!(
+                "Job {} received from the SV2 server for {channels}",
+                m.job_id
+            ),
         }
 
         let m_static = m.clone();
@@ -794,7 +834,10 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     group_channel_id.get_or_insert(channel_id);
                 });
                 let Some(group_channel_id) = group_channel_id else {
-                    error!("Aggregated channel does not belong to any group channel");
+                    error!(
+                        aggregated_channel_id,
+                        "Aggregated channel does not belong to any group channel"
+                    );
                     return Err(TproxyError::fallback(TproxyErrorKind::ChannelNotFound));
                 };
 
@@ -809,7 +852,11 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                             extended_channel
                                 .on_new_extended_mining_job(m_static.clone())
                                 .map_err(|e| {
-                                    error!("Failed to process new extended mining job: {:?}", e);
+                                    error!(
+                                        error = ?e,
+                                        channel_id = m_static.channel_id,
+                                        "Failed to process new extended mining job"
+                                    );
                                     TproxyError::fallback(
                                         TproxyErrorKind::FailedToProcessNewExtendedMiningJob,
                                     )
@@ -826,9 +873,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                 } else {
                     // we got a nonsense channel id, we should log an error and ignore the
                     // message
-                    error!(
-                        "Channel not found: {}, ignoring NewExtendedMiningJob message",
-                        m_static.channel_id
+                    warn!(
+                        channel_id = m_static.channel_id,
+                        "Ignoring NewExtendedMiningJob for unknown channel"
                     );
                     return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                 }
@@ -840,8 +887,8 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                         let full_extranonce_size =
                             group_channel.get_full_extranonce_size().ok_or_else(|| {
                                 error!(
-                                    "Group channel {} has no full extranonce size",
-                                    m.channel_id
+                                    group_channel_id = m.channel_id,
+                                    "Group channel has no full extranonce size"
                                 );
                                 TproxyError::fallback(TproxyErrorKind::ChannelNotFound)
                             })?;
@@ -865,8 +912,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                                     channel.on_new_extended_mining_job(job.clone()).map_err(
                                         |e| {
                                             error!(
-                                                "Failed to process new extended mining job: {:?}",
-                                                e
+                                                error = ?e,
+                                                channel_id,
+                                                "Failed to process new extended mining job"
                                             );
                                             TproxyError::fallback(
                                             TproxyErrorKind::FailedToProcessNewExtendedMiningJob,
@@ -904,7 +952,11 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                         channel
                             .on_new_extended_mining_job(m_static.clone())
                             .map_err(|e| {
-                                error!("Failed to process new extended mining job: {:?}", e);
+                                error!(
+                                    error = ?e,
+                                    channel_id = m_static.channel_id,
+                                    "Failed to process new extended mining job"
+                                );
                                 TproxyError::fallback(
                                     TproxyErrorKind::FailedToProcessNewExtendedMiningJob,
                                 )
@@ -917,9 +969,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                         })
                     });
                 let Some(message) = message else {
-                    error!(
-                        "Channel not found: {}, ignoring NewExtendedMiningJob message",
-                        m_static.channel_id
+                    warn!(
+                        channel_id = m_static.channel_id,
+                        "Ignoring NewExtendedMiningJob for unknown channel"
                     );
                     return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                 };
@@ -945,7 +997,14 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: SetNewPrevHashOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        info!("Received: {}", m);
+        debug!("Received from SV2 server: {}", m);
+        let (channels, plural, _) = self.describe_job_target(m.channel_id);
+        info!(
+            "New prevhash {} from the SV2 server, {channels} {} job {}",
+            format_prev_hash(&m.prev_hash.to_array()),
+            if plural { "start" } else { "starts" },
+            m.job_id
+        );
         let mut m_static = m.clone();
 
         // we update the channel states and keep track of the messages that need to be sent to the
@@ -971,7 +1030,10 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                         group_channel_id.get_or_insert(channel_id);
                     });
                     let Some(group_channel_id) = group_channel_id else {
-                        error!("Aggregated channel does not belong to any group channel");
+                        error!(
+                            aggregated_channel_id,
+                            "Aggregated channel does not belong to any group channel"
+                        );
                         return Err(TproxyError::fallback(TproxyErrorKind::ChannelNotFound));
                     };
 
@@ -983,7 +1045,11 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                                 extended_channel
                                     .on_set_new_prev_hash(m_static.clone())
                                     .map_err(|e| {
-                                        error!("Failed to set new prev hash: {:?}", e);
+                                        error!(
+                                            error = ?e,
+                                            channel_id = m.channel_id,
+                                            "Failed to set new previous hash"
+                                        );
                                         TproxyError::fallback(
                                             TproxyErrorKind::FailedToProcessSetNewPrevHash,
                                         )
@@ -1014,8 +1080,8 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                         // we got a nonsense channel id, we should log an error and ignore
                         // the message
                         warn!(
-                            "Channel not found: {}, ignoring SetNewPrevHash message",
-                            m_static.channel_id
+                            channel_id = m_static.channel_id,
+                            "Ignoring SetNewPrevHash for unknown channel"
                         );
                         return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                     }
@@ -1027,7 +1093,11 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                             group_channel
                                 .on_set_new_prev_hash(m_static.clone())
                                 .map_err(|e| {
-                                    error!("Failed to set new prev hash: {:?}", e);
+                                    error!(
+                                        error = ?e,
+                                        group_channel_id = m.channel_id,
+                                        "Failed to set new previous hash on group channel"
+                                    );
                                     TproxyError::fallback(
                                         TproxyErrorKind::FailedToProcessSetNewPrevHash,
                                     )
@@ -1045,7 +1115,11 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                                     .with_mut(&channel_id, |channel| {
                                         channel.on_set_new_prev_hash(m_static.clone()).map_err(
                                             |e| {
-                                                error!("Failed to set new prev hash: {:?}", e);
+                                                error!(
+                                                    error = ?e,
+                                                    channel_id,
+                                                    "Failed to set new previous hash on channel"
+                                                );
                                                 TproxyError::fallback(
                                                     TproxyErrorKind::FailedToProcessSetNewPrevHash,
                                                 )
@@ -1091,7 +1165,11 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                                 channel
                                     .on_set_new_prev_hash(m_static.clone())
                                     .map_err(|e| {
-                                        error!("Failed to set new prev hash: {:?}", e);
+                                        error!(
+                                            error = ?e,
+                                            channel_id = m_static.channel_id,
+                                            "Failed to set new previous hash"
+                                        );
                                         TproxyError::fallback(
                                             TproxyErrorKind::FailedToProcessSetNewPrevHash,
                                         )
@@ -1107,8 +1185,8 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                         // we got a nonsense channel id, we should log an error and ignore the
                         // message
                         warn!(
-                            "Channel not found: {}, ignoring SetNewPrevHash message",
-                            m_static.channel_id
+                            channel_id = m_static.channel_id,
+                            "Ignoring SetNewPrevHash for unknown channel"
                         );
                         return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                     };
@@ -1132,7 +1210,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                 .send(MiningOwned::SetNewPrevHash(message))
                 .await
                 .map_err(|e| {
-                    error!("Failed to send SetNewPrevHash: {:?}", e);
+                    debug!(error = ?e, "Failed to forward message (channel closed)");
                     TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
                 })?;
         }
@@ -1151,9 +1229,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: SetCustomMiningJobSuccessOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        warn!("Received: {}", m);
+        debug!("Received from SV2 server: {}", m);
         warn!(
-            "⚠️ Cannot process SetCustomMiningJobSuccess since Translator Proxy does not support custom mining jobs. Ignoring."
+            "SetCustomMiningJob.Success unexpected: Translator Proxy does not support custom mining jobs"
         );
         Err(TproxyError::log(TproxyErrorKind::UnexpectedMessage(
             0,
@@ -1167,9 +1245,9 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: SetCustomMiningJobErrorOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        warn!("Received: {}", m);
+        debug!("Received from SV2 server: {}", m);
         warn!(
-            "⚠️ Cannot process SetCustomMiningJobError since Translator Proxy does not support custom mining jobs. Ignoring."
+            "SetCustomMiningJob.Error unexpected: Translator Proxy does not support custom mining jobs"
         );
         Err(TproxyError::log(TproxyErrorKind::UnexpectedMessage(
             0,
@@ -1190,7 +1268,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: SetTargetOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        info!("Received: {}", m);
+        debug!("Received from SV2 server: {}", m);
 
         let m_static = m.clone();
         let new_target = Target::from_le_bytes(m.target.to_array());
@@ -1215,7 +1293,10 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     group_channel_id.get_or_insert(channel_id);
                 });
                 let Some(group_channel_id) = group_channel_id else {
-                    error!("Aggregated channel does not belong to any group channel");
+                    error!(
+                        aggregated_channel_id,
+                        "Aggregated channel does not belong to any group channel"
+                    );
                     return Err(TproxyError::fallback(TproxyErrorKind::ChannelNotFound));
                 };
 
@@ -1229,7 +1310,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                         channel
                             .set_target(Target::from_le_bytes(m.target.to_array()))
                             .map_err(|e| {
-                                error!("Upstream SetTarget rejected: {:?}", e);
+                                error!(error = ?e, "Upstream SetTarget rejected by channel manager");
                                 TproxyError::fallback(TproxyErrorKind::FailedToProcessSetTarget)
                             })
                     })?;
@@ -1241,8 +1322,8 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     // we got a nonsense channel id, we should log an error and ignore the
                     // message
                     warn!(
-                        "Channel not found: {}, ignoring SetTarget message",
-                        m_static.channel_id
+                        channel_id = m_static.channel_id,
+                        "Ignoring SetTarget for unknown channel"
                     );
                     return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                 }
@@ -1263,7 +1344,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                         })
                         .ok_or(TproxyError::fallback(TproxyErrorKind::ChannelNotFound))?
                         .map_err(|e| {
-                            error!("Upstream SetTarget rejected: {:?}", e);
+                            error!(error = ?e, channel_id, "Upstream SetTarget rejected by channel manager");
                             TproxyError::fallback(TproxyErrorKind::FailedToProcessSetTarget)
                         })?;
 
@@ -1281,13 +1362,13 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                     // we got a nonsense channel id, we should log an error and ignore the
                     // message
                     warn!(
-                        "Channel not found: {}, ignoring SetTarget message",
-                        m_static.channel_id
+                        channel_id = m_static.channel_id,
+                        "Ignoring SetTarget for unknown channel"
                     );
                     return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                 };
                 res.map_err(|e| {
-                    error!("Upstream SetTarget rejected: {:?}", e);
+                    error!(error = ?e, channel_id = m.channel_id, "Upstream SetTarget rejected by channel manager");
                     TproxyError::fallback(TproxyErrorKind::FailedToProcessSetTarget)
                 })?;
 
@@ -1304,7 +1385,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
                 .send(MiningOwned::SetTarget(message))
                 .await
                 .map_err(|e| {
-                    error!("Failed to send SetTarget: {:?}", e);
+                    debug!(error = ?e, "Failed to forward message (channel closed)");
                     TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
                 })?;
         }
@@ -1318,7 +1399,7 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
         m: SetGroupChannelOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
-        info!("Received: {}", m);
+        debug!("Received from SV2 server: {}", m);
 
         if m.group_channel_id == AGGREGATED_CHANNEL_ID {
             error!(
@@ -1387,7 +1468,12 @@ impl HandleMiningMessagesFromServerOwnedAsync for ChannelManager {
             replacement_group
                 .add_channel_id(*channel_id, full_extranonce_size)
                 .map_err(|error| {
-                    error!("Failed to add channel id to group channel: {error:?}");
+                    error!(
+                        error = ?error,
+                        channel_id = *channel_id,
+                        group_channel_id = m.group_channel_id,
+                        "Failed to add channel ID to group channel"
+                    );
                     TproxyError::fallback(TproxyErrorKind::FailedToAddChannelIdToGroupChannel(
                         error,
                     ))
@@ -1459,13 +1545,67 @@ impl ChannelManager {
                     full_extranonce_size,
                 )
                 .map_err(|e| {
-                    error!("NewExtendedMiningJob failed payout verification: {e}");
+                    error!(error = %e, "NewExtendedMiningJob failed payout verification");
                     TproxyError::fallback(TproxyErrorKind::PayoutVerificationFailed(e.to_string()))
                 })?;
         }
 
         Ok(())
     }
+
+    /// Names, for log lines meant for operators, the SV2 channels a message sent to `channel_id`
+    /// applies to, whether there are several, and the previous block hash they currently mine on.
+    ///
+    /// A message sent to a group channel applies to every channel in it; in aggregated mode that
+    /// is the one aggregated channel.
+    fn describe_job_target(&self, channel_id: ChannelId) -> (String, bool, Option<String>) {
+        let prev_hash_of = |key: ChannelId| {
+            self.extended_channels
+                .with(&key, |channel| {
+                    channel
+                        .get_chain_tip()
+                        .map(|tip| format_prev_hash(&tip.prev_hash().to_array()))
+                })
+                .flatten()
+        };
+        if self.mode.is_aggregated() {
+            let id = self
+                .extended_channels
+                .with(&AGGREGATED_CHANNEL_ID, |channel| channel.get_channel_id())
+                .unwrap_or(channel_id);
+            return (
+                format!("SV2 channel {id}"),
+                false,
+                prev_hash_of(AGGREGATED_CHANNEL_ID),
+            );
+        }
+        match self.group_channels.with(&channel_id, |group| {
+            group.get_channel_ids().copied().collect::<Vec<_>>()
+        }) {
+            Some(members) => (
+                match members.as_slice() {
+                    [member] => format!("SV2 channel {member}"),
+                    _ => format!(
+                        "{} SV2 channels (group channel {channel_id})",
+                        members.len()
+                    ),
+                },
+                members.len() != 1,
+                members.first().and_then(|&member| prev_hash_of(member)),
+            ),
+            None => (
+                format!("SV2 channel {channel_id}"),
+                false,
+                prev_hash_of(channel_id),
+            ),
+        }
+    }
+}
+
+/// Formats a previous block hash, given in the byte order SV2 carries it in, the way block
+/// explorers show it.
+fn format_prev_hash(prev_hash: &[u8; 32]) -> String {
+    BlockHash::from_byte_array(*prev_hash).to_string()
 }
 
 #[cfg(test)]
