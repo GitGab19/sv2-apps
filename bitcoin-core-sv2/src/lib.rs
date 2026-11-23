@@ -39,3 +39,5 @@ pub mod unix_capnp;
 
 /// Shared runtime cancellation primitive used by both TDP and JDP APIs.
 pub use tokio_util::sync::CancellationToken;
+
+// rehearsal: a change without a version bump
